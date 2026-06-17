@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# coc — 检查 ~/.config 中哪些配置属于已卸载的软件
+#
+# 用法:
+#   coc              扫描模式
+#   coc --clean      扫描后交互式清理
+#   coc --verbose    显示全部
+#   coc --json       输出 JSON
+#
+# 检测方式（多重交叉验证）:
+#   1. 映射表:  config目录名 ↔ 包名/命令名
+#   2. 包管理器: pacman / dpkg 查包是否安装
+#   3. AppImage: 扫描 ~/软件/, ~/Applications/ 等常用目录
+#   4. .desktop: 检查 /usr/share/applications
+#   5. 特征识别: KDE .rc 文件、系统自动生成文件等
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+VERBOSE=false
+CLEAN=false
+JSON=false
+
+# AppImage 扫描路径
+APPIMAGE_DIRS=(
+  "$HOME/软件"
+  "$HOME/Applications"
+  "$HOME/AppImages"
+  "$HOME/.local/bin"
+)
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --clean|-c)    CLEAN=true; shift ;;
+    --verbose|-v)  VERBOSE=true; shift ;;
+    --json|-j)     JSON=true; shift ;;
+    --help|-h)
+      echo "用法: coc [--clean] [--verbose] [--json]"
+      echo "  扫描 ~/.config 中已卸载软件的配置残留"
+      echo "  --clean     扫描后交互式清理"
+      echo "  --json      输出 JSON"
+      echo "  --verbose   显示正常条目"
+      exit 0 ;;
+    *) echo "未知参数: $1"; exit 1 ;;
+  esac
+done
+
+# ── 工具函数 ──
+
+has_cmd()    { command -v "$1" &>/dev/null; }
+has_pac()    { has_cmd pacman && pacman -Qi "$1" &>/dev/null; }
+has_dpkg()   { has_cmd dpkg   && dpkg -l "$1" &>/dev/null 2>&1; }
+has_flatpak(){ has_cmd flatpak && flatpak info "$1" &>/dev/null 2>&1; }
+
+pkg_ok() {
+  local pkg="$1"
+  has_pac "$pkg" && return 0
+  has_dpkg "$pkg" && return 0
+  return 1
+}
+
+cmd_ok() {
+  local name="$1"
+  has_cmd "$name" && return 0
+  has_cmd "${name,,}" && return 0
+  local flat="${name//[-_]/}"
+  has_cmd "$flat" && return 0
+  return 1
+}
+
+desktop_ok() {
+  local name="$1" lower="${1,,}"
+  find /usr/share/applications "$HOME/.local/share/applications" \
+    -maxdepth 1 \( -name "*${name}*" -o -name "*${lower}*" \) 2>/dev/null | grep -q .
+}
+
+# AppImage 检测：在常见路径下查找包含 config 名的 .AppImage 文件
+appimage_ok() {
+  local name="$1" lower="${1,,}"
+  for dir in "${APPIMAGE_DIRS[@]}"; do
+    [[ -d "$dir" ]] || continue
+    # 尝试精确匹配目录名
+    find "$dir" -maxdepth 1 -name "*${name}*.AppImage" 2>/dev/null | grep -q . && return 0
+    find "$dir" -maxdepth 1 -name "*${lower}*.AppImage" 2>/dev/null | grep -q . && return 0
+    # 尝试去连字符匹配
+    local flat="${name//[-_]/}"
+    find "$dir" -maxdepth 1 -name "*${flat}*.AppImage" 2>/dev/null | grep -q . && return 0
+  done
+  return 1
+}
+
+# ── 映射表：config名 | 包名(逗号分隔) | 命令名(逗号分隔) | AppImage名(逗号分隔) ──
+declare -a MAP
+def_map() { MAP+=("$1|$2|$3|$4"); }
+
+def_map "aseprite"        "aseprite,aseprite-bin"            "aseprite"                  "-"
+def_map "astro"           "-"                                "astro"                     "-"
+def_map "autostart"       "xdg-utils"                        "-"                         "-"
+def_map "Bitwarden"       "bitwarden"                        "bitwarden"                 "Bitwarden"
+def_map "bleachbit"       "bleachbit"                        "bleachbit"                 "-"
+def_map "blender"         "blender"                          "blender"                   "-"
+def_map "ChatLab"         "-"                                "-"                         "ChatLab"
+def_map "CherryStudio"    "cherry-studio"                    "cherry-studio"             "Cherry-Studio"
+def_map "chromium"        "chromium"                         "chromium"                  "-"
+def_map "configstore"     "-"                                "-"                         "-"
+def_map "dconf"           "dconf"                            "dconf"                     "-"
+def_map "Easytier"        "easytier"                         "easytier-core"             "-"
+def_map "Electron"        "electron,electron39,electron38"   "electron"                  "-"
+def_map "fastfetch"       "fastfetch"                        "fastfetch"                 "-"
+def_map "fcitx"           "fcitx"                            "fcitx"                     "-"
+def_map "fcitx5"          "fcitx5"                           "fcitx5"                    "-"
+def_map "GIMP"            "gimp"                             "gimp"                      "-"
+def_map "godot"           "godot"                            "godot"                     "-"
+def_map "gtk-3.0"         "gtk3"                             "-"                         "-"
+def_map "ibus"            "ibus"                             "ibus"                      "-"
+def_map "io.github.clash-verge-rev.clash-verge-rev" \
+                          "clash-verge-rev,clash-verge"      "clash-verge"               "Clash*"
+def_map "kitty"           "kitty"                            "kitty"                     "-"
+def_map "libaccounts-glib" "libaccounts-glib"                "-"                         "-"
+def_map "libreoffice"     "libreoffice-fresh,libreoffice-still" "libreoffice"            "-"
+def_map "ly"              "ly"                               "ly"                        "-"
+def_map "menus"           "libappmenu"                       "-"                         "-"
+def_map "mimeapps.list"   "xdg-utils"                        "-"                         "-"
+def_map "nextjs-nodejs"   "-"                                "-"                         "-"
+def_map "niri"            "niri"                             "niri"                      "-"
+def_map "noctalia"        "noctalia"                         "noctalia"                  "-"
+def_map "nomacs"          "nomacs"                           "nomacs"                    "-"
+def_map "nvim"            "neovim"                           "nvim"                      "-"
+def_map "obsidian"        "obsidian"                         "obsidian"                  "Obsidian"
+def_map "opencode"        "opencode"                         "opencode"                  "-"
+def_map "payload-nodejs"  "-"                                "-"                         "-"
+def_map "procps"          "procps-ng"                        "procps"                    "-"
+def_map "ProtonPlus"      "protonplus"                       "protonplus"                "-"
+def_map "pulse"           "pipewire-pulse,pulseaudio"        "pulseaudio"                "-"
+def_map "QtProject.conf"  "qt5-base,qt6-base"                "-"                         "-"
+def_map "satty"           "satty"                            "satty"                     "-"
+def_map "Starship"        "starship"                         "starship"                  "-"
+def_map "systemd"         "systemd"                          "systemctl"                 "-"
+def_map "tiled"           "tiled"                            "tiled"                     "-"
+def_map "udiskie"         "udiskie"                          "udiskie"                   "-"
+def_map "user-dirs.dirs"  "xdg-user-dirs"                    "-"                         "-"
+def_map "user-dirs.locale" "xdg-user-dirs"                   "-"                         "-"
+def_map "uv"              "uv"                               "uv"                        "-"
+def_map "vlc"             "vlc"                              "vlc"                       "-"
+def_map "ww_manager"      "ww-manager,wuthering-waves"      "ww_manager"                "wutheringwaves*"
+def_map "yazi"            "yazi"                             "yazi"                      "-"
+def_map "zen"             "zen-browser"                      "zen-browser"               "zen"
+def_map "kwalletrc"       "kwallet"                          "kwalletd"                  "-"
+
+# ── 分类核心 ──
+# 输出格式: status|reason|size|age_days
+classify() {
+  local entry="$1" basename="$2" entry_type="$3"
+
+  local size
+  local mtime_age
+  size="$(du -sh "$entry" 2>/dev/null | cut -f1)"
+  local mtime_epoch
+  mtime_epoch="$(stat -c '%Y' "$entry" 2>/dev/null || echo 0)"
+  local now_epoch
+  now_epoch="$(date +%s)"
+  mtime_age=$(( (now_epoch - mtime_epoch) / 86400 ))
+
+  local de_lower
+  de_lower="$(echo "${XDG_CURRENT_DESKTOP:-${XDG_SESSION_DESKTOP:-unknown}}" | tr '[:upper:]' '[:lower:]')"
+
+  # ── 查映射表 ──
+  for mapping in "${MAP[@]}"; do
+    local map_name="${mapping%%|*}"
+    local rest="${mapping#*|}"
+    local pkg_list="${rest%%|*}"
+    rest="${rest#*|}"
+    local cmd_list="${rest%%|*}"
+    local appimage_list="${rest#*|}"
+
+    [[ "$map_name" != "$basename" ]] && continue
+
+    # 1) 包管理器检查
+    if [[ "$pkg_list" != "-" ]]; then
+      IFS=',' read -ra pkgs <<< "$pkg_list"
+      for p in "${pkgs[@]}"; do
+        pkg_ok "$p" && echo "ok|package: $p|$size|$mtime_age" && return
+      done
+    fi
+
+    # 2) 命令检查
+    if [[ "$cmd_list" != "-" ]]; then
+      IFS=',' read -ra cmds <<< "$cmd_list"
+      for c in "${cmds[@]}"; do
+        cmd_ok "$c" && echo "ok|command: $c|$size|$mtime_age" && return
+      done
+    fi
+
+    # 3) AppImage 检查
+    if [[ "$appimage_list" != "-" ]]; then
+      IFS=',' read -ra apps <<< "$appimage_list"
+      for a in "${apps[@]}"; do
+        appimage_ok "$a" && echo "ok|AppImage: $a|$size|$mtime_age" && return
+      done
+    fi
+
+    # 4) .desktop 检查
+    desktop_ok "$basename" && echo "ok|.desktop found|$size|$mtime_age" && return
+
+    # 5) Flatpak 检查
+    has_flatpak "$basename" && echo "ok|flatpak: $basename|$size|$mtime_age" && return
+
+    # 都没匹配到 → 孤儿
+    echo "orphan|映射表命中但找不到安装包/命令/AppImage|$size|$mtime_age"
+    return
+  done
+
+  # ── 不在映射表中 → 动态推断 ──
+
+  # 1) KDE .rc 特征文件
+  if [[ "$basename" == *.rc ]]; then
+    if [[ "$de_lower" != *kde* && "$de_lower" != *plasma* ]]; then
+      local owner=""
+      has_cmd pacman && owner="$(pacman -Qo "$entry" 2>/dev/null | grep -oP 'is owned by \K\S+' || true)"
+      if [[ -n "$owner" ]]; then
+        pkg_ok "$owner" && echo "ok|package: $owner (owner)|$size|$mtime_age" && return
+        echo "orphan|KDE .rc 归属包 $owner 未安装|$size|$mtime_age" && return
+      fi
+      echo "orphan|KDE .rc 残留|$size|$mtime_age" && return
+    fi
+  fi
+
+  # 2) 命令名检测
+  cmd_ok "$basename" && echo "ok|命令: $basename|$size|$mtime_age" && return
+
+  # 3) AppImage 检测
+  appimage_ok "$basename" && echo "ok|AppImage: $basename|$size|$mtime_age" && return
+
+  # 4) 包名检测（仅目录）
+  if [[ "$entry_type" == "dir" ]]; then
+    local lower="${basename,,}"
+    pkg_ok "$basename" && echo "ok|package: $basename|$size|$mtime_age" && return
+    pkg_ok "$lower"    && echo "ok|package: $lower|$size|$mtime_age"    && return
+  fi
+
+  # 5) .desktop 文件
+  desktop_ok "$basename" && echo "ok|.desktop found|$size|$mtime_age" && return
+
+  # 6) 系统自动生成 → skip
+  if [[ "$basename" =~ ^(dconf|pulse) ]] \
+    || [[ "$basename" =~ ^(gtk-3\.0|fontconfig|xsettingsd|mimeapps|user-dirs) ]]; then
+    echo "skip|系统自动生成|$size|$mtime_age" && return
+  fi
+
+  # 真·未知
+  echo "unknown|无法判定归属|$size|$mtime_age"
+}
+
+# ── 输出 ──
+print_row() {
+  local basename="$1" entry_type="$2" status="$3" reason="$4" size="$5"
+  local color="" label=""
+  case "$status" in
+    ok)      color="\033[32m"; label="正常" ;;
+    orphan)  color="\033[31m"; label="孤儿" ;;
+    unknown) color="\033[33m"; label="未知" ;;
+    skip)    color="\033[90m"; label="跳过" ;;
+  esac
+  local icon="📁"
+  [[ "$entry_type" == "file" ]] && icon="📄"
+  printf "${color}%-30s %s %6s  %-6s %s\033[0m\n" "$basename" "$icon" "$size" "$label" "$reason"
+}
+
+print_json_entry() {
+  local basename="$1" entry_type="$2" status="$3" reason="$4" size="$5" mtime_age="$6"
+  local comma="$7"
+  local reason_esc size_esc
+  reason_esc="$(echo "$reason" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo "\"$reason\"")"
+  size_esc="$(echo "$size" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo "\"$size\"")"
+  echo "$comma"
+  echo "    {\"name\":\"$basename\",\"type\":\"$entry_type\",\"status\":\"$status\",\"size\":$size_esc,\"age_days\":$mtime_age,\"reason\":$reason_esc}"
+}
+
+# ── 主流程 ──
+main() {
+  local de="${XDG_CURRENT_DESKTOP:-${XDG_SESSION_DESKTOP:-unknown}}"
+
+  if [[ "$JSON" == false ]]; then
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  ~/.config 孤儿配置检查"
+    echo "  桌面环境 : ${de^^}"
+    echo "  包管理器 : $(has_cmd pacman && echo 'pacman' || (has_cmd dpkg && echo 'dpkg' || echo '未检测到'))"
+    echo "  扫描路径 : $CONFIG_DIR"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+  fi
+
+  local orphans=0 unknowns=0 installed=0 skipped=0 total=0
+  local first_json=true
+
+  if [[ "$JSON" == true ]]; then
+    echo "{"
+    echo "  \"desktop\": \"$de\","
+    echo "  \"scanned_at\": \"$(date --iso-8601=seconds 2>/dev/null || date)\","
+    echo "  \"entries\": ["
+  fi
+
+  for entry in "$CONFIG_DIR"/*; do
+    [[ -e "$entry" ]] || continue
+    local basename
+    basename="$(basename "$entry")"
+    [[ "$basename" == .* ]] && continue
+
+    local entry_type="dir"
+    [[ -f "$entry" ]] && entry_type="file"
+
+    local result
+    result="$(classify "$entry" "$basename" "$entry_type")"
+    local status="${result%%|*}"
+    local rest="${result#*|}"
+    local reason="${rest%%|*}"
+    rest="${rest#*|}"
+    local size="${rest%%|*}"
+    local mtime_age="${rest##*|}"
+
+    total=$((total + 1))
+    case "$status" in
+      ok)      installed=$((installed + 1)) ;;
+      orphan)  orphans=$((orphans + 1)) ;;
+      unknown) unknowns=$((unknowns + 1)) ;;
+      skip)    skipped=$((skipped + 1)) ;;
+    esac
+
+    if [[ "$JSON" == true ]]; then
+      print_json_entry "$basename" "$entry_type" "$status" "$reason" "$size" "$mtime_age" "$first_json"
+      first_json=false
+    elif [[ "$status" == "orphan" || "$status" == "unknown" || "$VERBOSE" == true ]]; then
+      print_row "$basename" "$entry_type" "$status" "$reason" "$size"
+    fi
+  done
+
+  if [[ "$JSON" == true ]]; then
+    echo ""
+    echo "  ],"
+    echo "  \"summary\": {"
+    echo "    \"orphans\": $orphans,"
+    echo "    \"unknowns\": $unknowns,"
+    echo "    \"installed\": $installed,"
+    echo "    \"skipped\": $skipped"
+    echo "  }"
+    echo "}"
+    return
+  fi
+
+  # ── 统计面板 ──
+  echo ""
+  echo "───────────────────────────────────────────────────────────"
+  echo "  统计"
+  echo "───────────────────────────────────────────────────────────"
+  printf "  \033[31m孤儿 (orphan):    %d\033[0m  已卸载软件的配置残留\n" "$orphans"
+  printf "  \033[33m未知 (unknown):   %d\033[0m  无法判定，需要人工确认\n" "$unknowns"
+  printf "  \033[32m正常 (ok):        %d\033[0m  软件仍在安装中\n" "$installed"
+  printf "  \033[90m跳过 (skip):      %d\033[0m  系统自动生成\n" "$skipped"
+  echo ""
+
+  if [[ "$total" -gt 0 ]]; then
+    local clean_pct=$(( (orphans + unknowns) * 100 / total ))
+    echo "  提示: 可清理比例 ${clean_pct}% (孤儿+未知)，使用 --clean 交互式删除"
+  fi
+  echo ""
+
+  # ── 交互清理 ──
+  if [[ "$CLEAN" == true ]]; then
+    local suspect_entries=()
+    for entry in "$CONFIG_DIR"/*; do
+      [[ -e "$entry" ]] || continue
+      local basename
+      basename="$(basename "$entry")"
+      [[ "$basename" == .* ]] && continue
+      local result
+      result="$(classify "$entry" "$basename" "dir")"
+      local status="${result%%|*}"
+      [[ "$status" == "orphan" || "$status" == "unknown" ]] && suspect_entries+=("$entry|$basename")
+    done
+
+    if [[ ${#suspect_entries[@]} -eq 0 ]]; then
+      echo "🎉 没有需要清理的条目！"
+      return
+    fi
+
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║          交互式清理 — 选择要删除的项目                ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    local idx=0
+    for item in "${suspect_entries[@]}"; do
+      local name="${item#*|}"
+      local path="${item%%|*}"
+      local size
+      size="$(du -sh "$path" 2>/dev/null | cut -f1)"
+      idx=$((idx + 1))
+      printf "  [%2d] %-28s %s\n" "$idx" "$name" "$size"
+    done
+    echo ""
+    echo "  [a] 全部删除    [q] 取消"
+    echo ""
+    printf "  输入编号（空格分隔）: "
+    read -r choice
+
+    case "$choice" in
+      q|Q) echo "已取消。"; return ;;
+      a|A)
+        echo "正在删除全部 ${#suspect_entries[@]} 项..."
+        for item in "${suspect_entries[@]}"; do
+          local path="${item%%|*}"
+          rm -rf "$path"
+          echo "  ❌ 已删除: $(basename "$path")"
+        done
+        echo "✅ 完成！"
+        ;;
+      *)
+        for num in $choice; do
+          local i=$((num - 1))
+          if [[ $i -ge 0 && $i -lt ${#suspect_entries[@]} ]]; then
+            local path="${suspect_entries[$i]%%|*}"
+            rm -rf "$path"
+            echo "  ❌ 已删除: $(basename "$path")"
+          fi
+        done
+        echo "✅ 完成！"
+        ;;
+    esac
+  fi
+}
+
+main "$@"

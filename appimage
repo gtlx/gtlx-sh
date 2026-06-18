@@ -1,0 +1,101 @@
+#!/bin/bash
+# AppImage -i — 为 AppImage 创建 .desktop 文件并提取图标
+# 用法: AppImage -i <AppImage文件路径>
+
+set -euo pipefail
+
+if [ $# -ne 2 ] || [ "$1" != "-i" ]; then
+    echo "用法: AppImage -i <AppImage文件路径>"
+    exit 1
+fi
+
+appimage=$(realpath "$2")
+
+if [ ! -f "$appimage" ]; then
+    echo "错误: 文件不存在 — $appimage"
+    exit 1
+fi
+
+if [ ! -x "$appimage" ]; then
+    chmod +x "$appimage"
+fi
+
+echo "正在提取 $appimage ..."
+
+# 提取到临时目录
+workdir=$(mktemp -d /tmp/appimage-XXXXXX)
+cd "$workdir" || exit 1
+
+if ! "$appimage" --appimage-extract >/dev/null 2>&1; then
+    echo "错误: 提取失败"
+    rm -rf "$workdir"
+    exit 1
+fi
+
+if [ ! -d squashfs-root ]; then
+    echo "错误: 提取目录未找到"
+    rm -rf "$workdir"
+    exit 1
+fi
+
+# 查找 .desktop 文件
+desktop_file=""
+for f in squashfs-root/*.desktop; do
+    [ -f "$f" ] && desktop_file="$f" && break
+done
+
+# 查找图标 (优先 png, 其次 svg, 再找 .DirIcon)
+icon_file=""
+for ext in png svg; do
+    for f in squashfs-root/*."$ext"; do
+        [ -f "$f" ] && icon_file="$f" && break 2
+    done
+done
+if [ -z "$icon_file" ] && [ -f squashfs-root/.DirIcon ]; then
+    icon_file=$(readlink -f squashfs-root/.DirIcon)
+fi
+
+if [ -z "$desktop_file" ]; then
+    echo "错误: 未找到 .desktop 文件"
+    rm -rf "$workdir"
+    exit 1
+fi
+if [ -z "$icon_file" ]; then
+    echo "错误: 未找到图标文件"
+    rm -rf "$workdir"
+    exit 1
+fi
+
+# 获取 AppImage 文件名 (不含路径和扩展名)
+filename=$(basename "$appimage")
+name="${filename%%.*}"
+
+# 目标目录
+icons_dir="$HOME/.local/share/icons"
+apps_dir="$HOME/.local/share/applications"
+mkdir -p "$icons_dir" "$apps_dir"
+
+# 复制图标
+icon_dest="$icons_dir/$(basename "$icon_file")"
+cp "$icon_file" "$icon_dest"
+echo "图标 → $icon_dest"
+
+# 复制并修改 .desktop 文件
+desktop_dest="$apps_dir/$name.desktop"
+cp "$desktop_file" "$desktop_dest"
+sed -i "s|^Exec=.*|Exec=$appimage %U|" "$desktop_dest"
+sed -i "s|^TryExec=.*||" "$desktop_dest"
+sed -i "s|^Icon=.*|Icon=$icon_dest|" "$desktop_dest"
+# 清理空白的 TryExec 行
+sed -i '/^TryExec=$/d' "$desktop_dest"
+echo ".desktop → $desktop_dest"
+
+# 清理
+rm -rf "$workdir"
+
+# 刷新桌面数据库
+if command -v update-desktop-database &>/dev/null; then
+    update-desktop-database "$apps_dir" 2>/dev/null || true
+fi
+
+echo "✅ 完成！$name 已添加到应用程序菜单。"

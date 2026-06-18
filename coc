@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # coc — 检查 ~/.config 中哪些配置属于已卸载的软件
 #
+# Copyright (C) 2025 gtlx
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
 # 用法:
 #   coc              扫描模式
 #   coc --clean      扫描后交互式清理

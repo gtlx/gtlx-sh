@@ -1,6 +1,9 @@
 #!/bin/bash
 # AppImage -i — 为 AppImage 创建 .desktop 文件并提取图标
 # 用法: AppImage -i <AppImage文件路径>
+#
+# Copyright (C) 2025 gtlx
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 set -euo pipefail
 

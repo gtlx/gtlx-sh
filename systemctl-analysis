@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+# ==========================================================
+# systemctl-服务分析脚本
+# 功能：全面分析 systemd 服务状态并输出报告
+# 用法：bash systemctl-analysis.sh [--json] [--output FILE]
+# ==========================================================
+
+set -euo pipefail
+
+# ─── 颜色定义 ───────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ─── 参数解析 ───────────────────────────────────────────────
+OUTPUT_MODE="terminal"  # terminal | json | file
+OUTPUT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) OUTPUT_MODE="json" ;;
+    --output|-o)
+      OUTPUT_MODE="file"
+      OUTPUT_FILE="$2"
+      shift
+      ;;
+    --help|-h)
+      echo "用法: $0 [选项]"
+      echo "  --json        以 JSON 格式输出"
+      echo "  -o, --output FILE  输出到文件（Markdown 格式）"
+      echo "  --help, -h    显示帮助"
+      exit 0
+      ;;
+    *) echo "未知参数: $1"; exit 1 ;;
+  esac
+  shift
+done
+
+# ─── 工具函数 ───────────────────────────────────────────────
+
+print_section() {
+  echo -e "\n${BOLD}${BLUE}━━━ $1 ━━━${NC}"
+}
+
+print_ok()   { echo -e "  ${GREEN}✅${NC} $1"; }
+print_warn() { echo -e "  ${YELLOW}⚠️  $1${NC}"; }
+print_err()  { echo -e "  ${RED}❌ $1${NC}"; }
+print_info() { echo -e "  ${CYAN}ℹ️  $1${NC}"; }
+
+# ─── 数据收集 ───────────────────────────────────────────────
+
+collect_data() {
+  local tmpdir
+  tmpdir=$(mktemp -d)
+
+  # 1. 运行中的服务
+  systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/running_services.txt" || true
+
+  # 2. 失败的服务
+  systemctl list-units --type=service --state=failed --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/failed_services.txt" || true
+
+  # 3. not-found 服务
+  systemctl list-units --type=service --state=not-found --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/notfound_services.txt" || true
+
+  # 4. 全部服务
+  systemctl list-unit-files --type=service --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/all_service_files.txt" || true
+  systemctl list-units --type=service --all --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/all_services.txt" || true
+
+  # 5. 已启用
+  systemctl list-unit-files --type=service --state=enabled --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/enabled_services.txt" || true
+
+  # 6. 已禁用
+  systemctl list-unit-files --type=service --state=disabled --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/disabled_services.txt" || true
+
+  # 7. masked
+  systemctl list-unit-files --type=service --state=masked --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/masked_services.txt" || true
+
+  # 8. Timers
+  systemctl list-timers --all --no-pager --no-legend 2>/dev/null \
+    > "$tmpdir/timers.txt" || true
+
+  # 9. 启动耗时
+  systemd-analyze 2>/dev/null > "$tmpdir/boot_analyze.txt" || true
+  systemd-analyze blame --no-pager 2>/dev/null | head -15 \
+    > "$tmpdir/boot_blame.txt" || true
+
+  # 10. 统计 not-found 引用的来源
+  : > "$tmpdir/notfound_refs.txt"
+  while IFS=' ' read -r unit load active sub desc; do
+    local srv_name="${unit%%.*}"
+    grep -rl "${srv_name}" /etc/systemd/system/ /usr/lib/systemd/system/ 2>/dev/null \
+      >> "$tmpdir/notfound_refs.txt" || true
+  done < "$tmpdir/notfound_services.txt"
+
+  # 11. 检查 multi-user.target.wants 中的坏链
+  find /etc/systemd/system/multi-user.target.wants/ -xtype l 2>/dev/null \
+    > "$tmpdir/stale_symlinks.txt" || true
+
+  # 12. 检查其他 wants 中的坏链
+  find /etc/systemd/system/*.wants/ -xtype l 2>/dev/null \
+    > "$tmpdir/all_stale_symlinks.txt" || true
+
+  # 13. 分类 not-found 服务：可清理（有坏链残留）vs 无害（系统包依赖引用）
+  : > "$tmpdir/notfound_cleanable.txt"
+  : > "$tmpdir/notfound_harmless.txt"
+  # 提取所有坏链对应的服务名
+  local stale_names=""
+  if [[ -s "$tmpdir/all_stale_symlinks.txt" ]]; then
+    while IFS='' read -r symlink; do
+      local sname
+      sname=$(basename "$symlink")
+      stale_names="$stale_names $sname"
+    done < "$tmpdir/all_stale_symlinks.txt"
+  fi
+  while IFS='' read -r rawline; do
+    # systemctl not-found 输出格式: ● unit.service  ...
+    local srv_name
+    srv_name=$(echo "$rawline" | awk '{print $2}')
+    if [[ -z "$srv_name" ]]; then continue; fi
+    if echo "$stale_names" | grep -qF "$srv_name" 2>/dev/null; then
+      echo "$srv_name" >> "$tmpdir/notfound_cleanable.txt"
+    else
+      echo "$srv_name" >> "$tmpdir/notfound_harmless.txt"
+    fi
+  done < "$tmpdir/notfound_services.txt"
+
+  echo "$tmpdir"
+}
+
+# ─── 终端输出 ───────────────────────────────────────────────
+
+output_terminal() {
+  local d="$1"
+
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}${CYAN}║      Systemctl 服务分析报告                  ║${NC}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${NC}"
+  echo -e "生成时间: $(date '+%Y-%m-%d %H:%M:%S')\n"
+
+  # ── 基本信息 ──
+  print_section "基本信息"
+  local total running failed notfound masked
+  total=$(wc -l < "$d/all_services.txt")
+  running=$(wc -l < "$d/running_services.txt")
+  failed=$(wc -l < "$d/failed_services.txt")
+  notfound=$(wc -l < "$d/notfound_services.txt")
+  masked=$(wc -l < "$d/masked_services.txt")
+  print_info "服务总数: $total"
+  print_ok  "运行中:   $running"
+  if [[ "$failed" -gt 0 ]]; then
+    print_err "失败:     $failed"
+  else
+    print_ok  "失败:     0"
+  fi
+  if [[ "$notfound" -gt 0 ]]; then
+    print_warn "not-found: $notfound"
+  else
+    print_ok  "not-found: 0"
+  fi
+  if [[ "$masked" -gt 0 ]]; then
+    print_warn "masked:    $masked"
+  else
+    print_ok  "masked:    0"
+  fi
+
+  # ── 运行中服务 ──
+  print_section "当前运行中的服务"
+  if [[ -s "$d/running_services.txt" ]]; then
+    while IFS='' read -r line; do
+      local name desc
+      name=$(echo "$line" | awk '{print $1}')
+      desc=$(echo "$line" | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+      echo -e "  ${GREEN}●${NC} ${name}"
+      echo -e "    └─ ${desc}"
+    done < "$d/running_services.txt"
+  else
+    print_warn "没有运行中的服务"
+  fi
+
+  # ── 失败服务 ──
+  if [[ -s "$d/failed_services.txt" ]]; then
+    print_section "失败的服务"
+    while IFS='' read -r line; do
+      local name desc
+      name=$(echo "$line" | awk '{print $1}')
+      desc=$(echo "$line" | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+      print_err "${name} — ${desc}"
+    done < "$d/failed_services.txt"
+  fi
+
+  # ── 已启用服务 ──
+  print_section "已启用的服务（开机自启）"
+  if [[ -s "$d/enabled_services.txt" ]]; then
+    while IFS='' read -r line; do
+      echo -e "  ${GREEN}●${NC} $(echo "$line" | awk '{print $1}')"
+    done < "$d/enabled_services.txt"
+  fi
+
+  # ── 定时器 ──
+  print_section "定时器（Timer）"
+  if [[ -s "$d/timers.txt" ]]; then
+    echo -e "  ${BOLD}下 次 执 行          │ 间 隔         │ 定时器                    │ 激活的服务${NC}"
+    echo "  ─────────────────────────────────────────────────────────────────────"
+    while IFS='' read -r line; do
+      echo "  $line"
+    done < "$d/timers.txt"
+  else
+    print_info "没有定时器"
+  fi
+
+  # ── 启动耗时 ──
+  print_section "启动耗时"
+  if [[ -s "$d/boot_analyze.txt" ]]; then
+    cat "$d/boot_analyze.txt" | sed 's/^/  /'
+  fi
+  echo ""
+  print_info "Top 10 耗时启动项:"
+  if [[ -s "$d/boot_blame.txt" ]]; then
+    head -10 "$d/boot_blame.txt" | sed 's/^/  /'
+  fi
+
+  # ── 异常 ──
+  print_section "异常状态检查"
+
+  # not-found 分类展示
+  local nf_cleanable=0 nf_harmless=0
+  [[ -s "$d/notfound_cleanable.txt" ]] && nf_cleanable=$(wc -l < "$d/notfound_cleanable.txt")
+  [[ -s "$d/notfound_harmless.txt" ]]  && nf_harmless=$(wc -l  < "$d/notfound_harmless.txt")
+
+  if [[ -s "$d/notfound_cleanable.txt" ]]; then
+    print_err "【可清理】以下服务有残留软链接（坏链），可安全删除 ($nf_cleanable 个):"
+    while IFS='' read -r srv_name; do
+      echo -e "    ${RED}●${NC} ${srv_name}"
+      # 显示对应的坏链路径
+      while IFS='' read -r sym; do
+        if echo "$sym" | grep -qF "${srv_name}" 2>/dev/null; then
+          echo -e "      └─ 坏链: ${YELLOW}$sym${NC}"
+        fi
+      done < "$d/all_stale_symlinks.txt"
+    done < "$d/notfound_cleanable.txt"
+    echo -e "\n  ${CYAN}清理命令:${NC}"
+    while IFS='' read -r sym; do
+      echo "    sudo rm \"$sym\""
+    done < "$d/all_stale_symlinks.txt"
+    echo "    sudo systemctl daemon-reload"
+  fi
+
+  if [[ -s "$d/notfound_harmless.txt" ]]; then
+    print_info "【无害】以下服务被系统包引用，无法消除也不影响运行 ($nf_harmless 个):"
+    while IFS='' read -r srv_name; do
+      echo -e "    ${CYAN}●${NC} ${srv_name}"
+      # 显示引用来源（最多 3 个）
+      local base_name
+      base_name=$(echo "${srv_name}" | sed 's/\.service//')
+      local refs
+      refs=$(grep -rlF "${base_name}." /usr/lib/systemd/system/ 2>/dev/null | head -3 | xargs -I{} basename {} .service 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+      if [[ -n "$refs" ]]; then
+        echo "      └─ 被引用自: $refs"
+      fi
+    done < "$d/notfound_harmless.txt"
+  fi
+
+  # masked
+  if [[ -s "$d/masked_services.txt" ]]; then
+    print_info "以下服务已被屏蔽（masked）:"
+    while IFS='' read -r line; do
+      echo -e "    ${CYAN}●${NC} $(echo "$line" | awk '{print $1}')"
+    done < "$d/masked_services.txt"
+  fi
+
+  # 总结
+  print_section "总结"
+  echo -e "  ${BOLD}指标${NC}            ${BOLD}数值${NC}"
+  echo "  ──────────────────────────────"
+  echo -e "  运行中服务:      ${GREEN}$running${NC}"
+  echo -e "  失败服务:        $([ "$failed" -eq 0 ] && echo "${GREEN}0${NC}" || echo "${RED}$failed${NC}")"
+  echo -e "  not-found 残留:  $([ "$notfound" -eq 0 ] && echo "${GREEN}0${NC}" || echo "${YELLOW}$notfound${NC}")"
+  echo -e "  masked:          $([ "$masked" -eq 0 ] && echo "${GREEN}0${NC}" || echo "${YELLOW}$masked${NC}")"
+
+  echo ""
+}
+
+# ─── JSON 输出 ──────────────────────────────────────────────
+
+output_json() {
+  local d="$1"
+
+  local total running failed notfound masked
+  total=$(wc -l < "$d/all_services.txt")
+  running=$(wc -l < "$d/running_services.txt")
+  failed=$(wc -l < "$d/failed_services.txt")
+  notfound=$(wc -l < "$d/notfound_services.txt")
+  masked=$(wc -l < "$d/masked_services.txt")
+
+  # 构建 running 数组
+  local running_json=""
+  while IFS='' read -r line; do
+    local name desc
+    name=$(echo "$line" | awk '{print $1}')
+    desc=$(echo "$line" | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+    running_json+="    {\"name\":\"${name}\",\"description\":\"${desc}\"},"
+  done < "$d/running_services.txt"
+  running_json="[${running_json%,}]"
+
+  # 构建 not-found 数组
+  local nf_json=""
+  while IFS='' read -r line; do
+    nf_json+="    \"$(echo "$line" | awk '{print $1'})\","
+  done < "$d/notfound_services.txt"
+  nf_json="[${nf_json%,}]"
+
+  # 构建 stale symlinks 数组
+  local sym_json=""
+  while IFS='' read -r line; do
+    sym_json+="    \"$line\","
+  done < "$d/stale_symlinks.txt"
+  sym_json="[${sym_json%,}]"
+
+  # 读取启动时间
+  local boot_time=""
+  if [[ -s "$d/boot_analyze.txt" ]]; then
+    boot_time=$(cat "$d/boot_analyze.txt" | tr '\n' ' ')
+  fi
+
+  jq -n \
+    --arg date "$(date -Iseconds)" \
+    --argjson total "$total" \
+    --argjson running "$running" \
+    --argjson failed "$failed" \
+    --argjson notfound "$notfound" \
+    --argjson masked "$masked" \
+    --argjson running_services "$running_json" \
+    --argjson notfound_services "$nf_json" \
+    --argjson stale_symlinks "$sym_json" \
+    --arg boot_time "$boot_time" \
+    '{
+      timestamp: $date,
+      summary: {
+        total: $total,
+        running: $running,
+        failed: $failed,
+        not_found: $notfound,
+        masked: $masked
+      },
+      running_services: $running_services,
+      not_found_services: $notfound_services,
+      stale_symlinks: $stale_symlinks,
+      boot_time: $boot_time
+    }'
+}
+
+# ─── Markdown 文件输出 ──────────────────────────────────────
+
+output_markdown() {
+  local d="$1"
+  local out="$2"
+
+  local total running failed notfound masked
+  total=$(wc -l < "$d/all_services.txt")
+  running=$(wc -l < "$d/running_services.txt")
+  failed=$(wc -l < "$d/failed_services.txt")
+  notfound=$(wc -l < "$d/notfound_services.txt")
+  masked=$(wc -l < "$d/masked_services.txt")
+
+  # 保存 stdout 并重定向到文件
+  exec 3>&1
+  exec > "$out"
+
+  cat <<EOF
+# Systemctl 服务分析报告
+
+> 生成时间：$(date '+%Y-%m-%d %H:%M:%S')
+> 系统：$(uname -o) $(uname -r)
+
+---
+
+## 概览
+
+| 指标 | 数值 |
+|------|------|
+| 服务总数 | $total |
+| 运行中 | $running |
+| 失败 | $failed |
+| not-found 残留 | $notfound |
+| masked | $masked |
+
+EOF
+
+  # 运行中
+  if [[ -s "$d/running_services.txt" ]]; then
+    echo -e "\n## 当前运行中的服务\n"
+    echo "| 服务 | 描述 |"
+    echo "|------|------|"
+    while IFS='' read -r line; do
+      local name desc
+      name=$(echo "$line" | awk '{print $1}')
+      desc=$(echo "$line" | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+      echo "| \`${name}\` | ${desc} |"
+    done < "$d/running_services.txt"
+  fi
+
+  # 失败
+  if [[ -s "$d/failed_services.txt" ]]; then
+    echo -e "\n## 失败的服务\n"
+    echo "| 服务 | 描述 |"
+    echo "|------|------|"
+    while IFS='' read -r line; do
+      local name desc
+      name=$(echo "$line" | awk '{print $1}')
+      desc=$(echo "$line" | awk '{$1=$2=$3=$4=""; print $0}' | xargs)
+      echo "| \`${name}\` | ${desc} |"
+    done < "$d/failed_services.txt"
+  else
+    echo -e "\n## 失败的服务\n\n✅ **无**"
+  fi
+
+  # 已启用
+  if [[ -s "$d/enabled_services.txt" ]]; then
+    echo -e "\n## 已启用服务（开机自启）\n"
+    while IFS='' read -r line; do
+      echo "- \`$(echo "$line" | awk '{print $1}')\`"
+    done < "$d/enabled_services.txt"
+  fi
+
+  # 启动耗时
+  if [[ -s "$d/boot_analyze.txt" ]]; then
+    echo -e "\n## 启动耗时\n"
+    echo '```'
+    cat "$d/boot_analyze.txt"
+    echo '```'
+  fi
+  if [[ -s "$d/boot_blame.txt" ]]; then
+    echo -e "\n### Top 15 耗时启动项\n"
+    echo '```'
+    cat "$d/boot_blame.txt"
+    echo '```'
+  fi
+
+  # not-found 分类展示
+  local nf_cleanable=0 nf_harmless=0
+  [[ -s "$d/notfound_cleanable.txt" ]] && nf_cleanable=$(wc -l < "$d/notfound_cleanable.txt")
+  [[ -s "$d/notfound_harmless.txt" ]]  && nf_harmless=$(wc -l  < "$d/notfound_harmless.txt")
+
+  if [[ -s "$d/notfound_cleanable.txt" ]]; then
+    echo -e "\n## 🔴 可清理的残留（$nf_cleanable 个）\n"
+    echo "这些服务由残留的软链接引用，可以安全删除："
+    echo ""
+    while IFS='' read -r srv_name; do
+      echo "- \`${srv_name}\`"
+      while IFS='' read -r sym; do
+        if echo "$sym" | grep -qF "${srv_name}" 2>/dev/null; then
+          echo "  - 坏链路径: \`$sym\`"
+        fi
+      done < "$d/all_stale_symlinks.txt"
+    done < "$d/notfound_cleanable.txt"
+    echo ""
+    echo '```bash'
+    while IFS='' read -r sym; do
+      echo "sudo rm \"$sym\""
+    done < "$d/all_stale_symlinks.txt"
+    echo 'sudo systemctl daemon-reload'
+    echo '```'
+  fi
+
+  if [[ -s "$d/notfound_harmless.txt" ]]; then
+    echo -e "\n## 🟡 无害的系统级引用（$nf_harmless 个）\n"
+    echo "这些服务被已安装的系统包引用，不影响运行，无需处理："
+    echo ""
+    while IFS='' read -r srv_name; do
+      local base_name
+      base_name=$(echo "${srv_name}" | sed 's/\.service//')
+      local refs
+      refs=$(grep -rlF "${base_name}." /usr/lib/systemd/system/ 2>/dev/null | head -3 | xargs -I{} basename {} .service 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+      echo "- \`${srv_name}\`"
+      if [[ -n "$refs" ]]; then
+        echo "  - 被引用自: \`${refs}\` 等"
+      fi
+    done < "$d/notfound_harmless.txt"
+  fi
+
+  # masked
+  if [[ -s "$d/masked_services.txt" ]]; then
+    echo -e "\n## 已屏蔽的服务（masked）\n"
+    while IFS='' read -r line; do
+      echo "- \`$(echo "$line" | awk '{print $1}')\`"
+    done < "$d/masked_services.txt"
+  fi
+
+  # 定时器
+  if [[ -s "$d/timers.txt" ]]; then
+    echo -e "\n## 定时器\n"
+    echo '```'
+    cat "$d/timers.txt"
+    echo '```'
+  fi
+
+  # 恢复 stdout
+  exec >&3
+  exec 3>&-
+}
+
+# ─── 主流程 ──────────────────────────────────────────────────
+
+main() {
+  # 检查依赖
+  if ! command -v systemctl &>/dev/null; then
+    echo "错误：未找到 systemctl 命令" >&2
+    exit 1
+  fi
+  if [[ "$OUTPUT_MODE" == "json" ]] && ! command -v jq &>/dev/null; then
+    echo "错误：JSON 模式需要安装 jq" >&2
+    exit 1
+  fi
+
+  # 检查权限（建议用 root）
+  if [[ $EUID -ne 0 ]]; then
+    echo -e "${YELLOW}⚠️  建议以 root 身份运行以获得完整信息${NC}" >&2
+  fi
+
+  echo -e "${CYAN}🔍 正在收集服务数据...${NC}"
+  local datadir
+  datadir=$(collect_data)
+  # 清理钩子
+  trap "rm -rf '$datadir'" EXIT
+
+  case "$OUTPUT_MODE" in
+    terminal)
+      output_terminal "$datadir"
+      ;;
+    json)
+      output_json "$datadir"
+      ;;
+    file)
+      output_markdown "$datadir" "$OUTPUT_FILE"
+      echo -e "${GREEN}✅ 报告已保存到: ${OUTPUT_FILE}${NC}"
+      ;;
+  esac
+}
+
+main "$@"

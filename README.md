@@ -96,3 +96,46 @@ systemctl-analysis -o ~/文档/服务报告.md
 # 查看 JSON
 systemctl-analysis --json | jq .summary
 ```
+
+---
+
+## gitpush — Git 自动提交推送工具
+
+智能的 Git 自动 commit & push 脚本，支持单发和批量提交、冲突交互处理、远程仓库管理。
+
+### 用法
+
+```bash
+gitpush                              # 提交默认文件夹（信息用时间戳）
+gitpush /路径/项目                     # 提交指定路径
+gitpush /路径/项目 "修复了xxx"         # 提交并写备注
+gitpush --set-folder /路径            # 设置默认文件夹
+gitpush --set-remote git@...          # 设置默认远程仓库
+gitpush --pull                        # 拉取远程更新
+gitpush --batch                       # 批量处理多个项目
+gitpush --show                        # 查看当前配置
+gitpush --help                        # 完整帮助
+```
+
+### 功能一览
+
+| 功能 | 说明 |
+|------|------|
+| 自动 commit & push | 一键提交，信息可选，默认时间戳 |
+| 批量处理 | 一个配置文件管理多个项目，逐一提交推送 |
+| 冲突交互处理 | pull 分叉时弹菜单选 merge/rebase |
+| push 被拒自动重试 | 被拒绝后自动拉取合并再推送 |
+| 智能初始化 | 非 Git 仓库自动 `git init` + 配置远程 |
+| 多层配置覆盖 | 默认 → 临时 `--remote/--user` → 显式 `--conf` |
+| 跨平台 | Linux/Mac/Android（Termux）均可使用 |
+
+### 详细说明
+
+完整的使用指南见 [`gitpush-使用指南.md`](./gitpush-使用指南.md)，包含：
+
+- 配置管理与配置文件路径控制
+- 批量任务配置格式与回退规则
+- 冲突处理流程详解（merge vs rebase）
+- `--pull` 拉取模式说明
+- 常见场景示例
+- Android Termux 注意事项

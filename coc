@@ -52,8 +52,8 @@ done
 
 has_cmd()    { command -v "$1" &>/dev/null; }
 has_pac()    { has_cmd pacman && pacman -Qi "$1" &>/dev/null; }
-has_dpkg()   { has_cmd dpkg   && dpkg -l "$1" &>/dev/null 2>&1; }
-has_flatpak(){ has_cmd flatpak && flatpak info "$1" &>/dev/null 2>&1; }
+has_dpkg()   { has_cmd dpkg-query && dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+has_flatpak(){ has_cmd flatpak && flatpak info "$1" &>/dev/null; }
 
 pkg_ok() {
   local pkg="$1"
@@ -98,14 +98,12 @@ def_map() { MAP+=("$1|$2|$3|$4"); }
 
 def_map "aseprite"        "aseprite,aseprite-bin"            "aseprite"                  "-"
 def_map "astro"           "-"                                "astro"                     "-"
-def_map "autostart"       "xdg-utils"                        "-"                         "-"
 def_map "Bitwarden"       "bitwarden"                        "bitwarden"                 "Bitwarden"
 def_map "bleachbit"       "bleachbit"                        "bleachbit"                 "-"
 def_map "blender"         "blender"                          "blender"                   "-"
 def_map "ChatLab"         "-"                                "-"                         "ChatLab"
 def_map "CherryStudio"    "cherry-studio"                    "cherry-studio"             "Cherry-Studio"
 def_map "chromium"        "chromium"                         "chromium"                  "-"
-def_map "configstore"     "-"                                "-"                         "-"
 def_map "dconf"           "dconf"                            "dconf"                     "-"
 def_map "Easytier"        "easytier"                         "easytier-core"             "-"
 def_map "Electron"        "electron,electron39,electron38"   "electron"                  "-"
@@ -122,8 +120,6 @@ def_map "kitty"           "kitty"                            "kitty"            
 def_map "libaccounts-glib" "libaccounts-glib"                "-"                         "-"
 def_map "libreoffice"     "libreoffice-fresh,libreoffice-still" "libreoffice"            "-"
 def_map "ly"              "ly"                               "ly"                        "-"
-def_map "menus"           "libappmenu"                       "-"                         "-"
-def_map "mimeapps.list"   "xdg-utils"                        "-"                         "-"
 def_map "nextjs-nodejs"   "-"                                "-"                         "-"
 def_map "niri"            "niri"                             "niri"                      "-"
 def_map "noctalia"        "noctalia"                         "noctalia"                  "-"
@@ -134,15 +130,12 @@ def_map "opencode"        "opencode"                         "opencode"         
 def_map "payload-nodejs"  "-"                                "-"                         "-"
 def_map "procps"          "procps-ng"                        "procps"                    "-"
 def_map "ProtonPlus"      "protonplus"                       "protonplus"                "-"
-def_map "pulse"           "pipewire-pulse,pulseaudio"        "pulseaudio"                "-"
 def_map "QtProject.conf"  "qt5-base,qt6-base"                "-"                         "-"
 def_map "satty"           "satty"                            "satty"                     "-"
 def_map "Starship"        "starship"                         "starship"                  "-"
 def_map "systemd"         "systemd"                          "systemctl"                 "-"
 def_map "tiled"           "tiled"                            "tiled"                     "-"
 def_map "udiskie"         "udiskie"                          "udiskie"                   "-"
-def_map "user-dirs.dirs"  "xdg-user-dirs"                    "-"                         "-"
-def_map "user-dirs.locale" "xdg-user-dirs"                   "-"                         "-"
 def_map "uv"              "uv"                               "uv"                        "-"
 def_map "vlc"             "vlc"                              "vlc"                       "-"
 def_map "ww_manager"      "ww-manager,wuthering-waves"      "ww_manager"                "wutheringwaves*"
@@ -155,9 +148,10 @@ def_map "kwalletrc"       "kwallet"                          "kwalletd"         
 classify() {
   local entry="$1" basename="$2" entry_type="$3"
 
-  local size
+  local size="?"
   local mtime_age
-  size="$(du -sh "$entry" 2>/dev/null | cut -f1)"
+  size="$(du -sh "$entry" 2>/dev/null | cut -f1 || true)"
+  [[ -z "$size" ]] && size="?"
   local mtime_epoch
   mtime_epoch="$(stat -c '%Y' "$entry" 2>/dev/null || echo 0)"
   local now_epoch
@@ -245,13 +239,24 @@ classify() {
   desktop_ok "$basename" && echo "ok|.desktop found|$size|$mtime_age" && return
 
   # 6) 系统自动生成 → skip
-  if [[ "$basename" =~ ^(dconf|pulse) ]] \
+  if [[ "$basename" =~ ^(dconf|pulse|autostart|configstore) ]] \
     || [[ "$basename" =~ ^(gtk-3\.0|fontconfig|xsettingsd|mimeapps|user-dirs) ]]; then
     echo "skip|系统自动生成|$size|$mtime_age" && return
   fi
 
   # 真·未知
   echo "unknown|无法判定归属|$size|$mtime_age"
+}
+
+# ── 工具: JSON 字符转义（纯 bash，不依赖 python3）──
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  printf '"%s"' "$s"
 }
 
 # ── 输出 ──
@@ -271,12 +276,16 @@ print_row() {
 
 print_json_entry() {
   local basename="$1" entry_type="$2" status="$3" reason="$4" size="$5" mtime_age="$6"
-  local comma="$7"
-  local reason_esc size_esc
-  reason_esc="$(echo "$reason" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo "\"$reason\"")"
-  size_esc="$(echo "$size" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null || echo "\"$size\"")"
-  echo "$comma"
-  echo "    {\"name\":\"$basename\",\"type\":\"$entry_type\",\"status\":\"$status\",\"size\":$size_esc,\"age_days\":$mtime_age,\"reason\":$reason_esc}"
+  local is_first="$7"
+  local name_esc size_esc reason_esc
+  name_esc="$(json_escape "$basename")"
+  size_esc="$(json_escape "$size")"
+  reason_esc="$(json_escape "$reason")"
+  # 在条目之间打印逗号（第一条前不打印）
+  if [[ "$is_first" != "true" ]]; then
+    echo ","
+  fi
+  echo "    {\"name\":$name_esc,\"type\":\"$entry_type\",\"status\":\"$status\",\"size\":$size_esc,\"age_days\":$mtime_age,\"reason\":$reason_esc}"
 }
 
 # ── 主流程 ──

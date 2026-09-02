@@ -4,141 +4,228 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>gtlx-sh 脚本索引</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230f8776'/><text x='50' y='72' font-size='62' text-anchor='middle'>⚡</text></svg>">
 <style>
   :root {
-    --bg1: #ecf4f1; --bg2: #dbeae4;
-    --card: rgba(255,255,255,.55); --border: rgba(255,255,255,.6);
-    --text: #173b34; --muted: #5d7a72;
-    --accent: #0f8776; --accent2: #14a58f;
-    --danger: #d64545; --shadow: 0 8px 30px rgba(20,70,60,.12);
+    --bg1: #ecf4f1; --bg2: #dcebe4; --bg3: #d3e6de;
+    --card: rgba(255,255,255,.55); --card-solid: rgba(255,255,255,.8);
+    --border: rgba(255,255,255,.7); --border-strong: rgba(15,135,118,.18);
+    --text: #173b34; --muted: #5d7a72; --faint: #8aa39c;
+    --accent: #0f8776; --accent2: #14a58f; --accent-soft: rgba(15,135,118,.12);
+    --danger: #d64545; --shadow: 0 10px 34px rgba(20,70,60,.13);
+    --shadow-lg: 0 18px 50px rgba(20,70,60,.18);
+    --radius: 18px; --radius-sm: 12px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: system-ui, "LXGW WenKai", "PingFang SC", sans-serif;
-    background: linear-gradient(135deg, var(--bg1), var(--bg2));
-    min-height: 100vh; color: var(--text); padding: 28px;
+    background: linear-gradient(135deg, var(--bg1), var(--bg2) 55%, var(--bg3));
+    min-height: 100vh; color: var(--text); padding: 30px; position: relative; overflow-x: hidden;
   }
-  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 22px; }
-  header h1 { font-size: 22px; letter-spacing: .3px; }
-  header span.path { color: var(--muted); font-size: 13px; }
-  .board {
-    display: flex; gap: 18px; align-items: flex-start;
+  /* 顶部光晕装饰 */
+  body::before {
+    content: ''; position: fixed; top: -120px; right: -120px; width: 380px; height: 380px;
+    background: radial-gradient(circle, rgba(20,165,143,.16), transparent 65%);
+    border-radius: 50%; pointer-events: none; z-index: 0;
   }
-  .groups {
-    flex: 0 0 300px; display: flex; flex-direction: column; gap: 14px;
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; flex-wrap: wrap; position: relative; z-index: 1; }
+  header .logo {
+    width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center; font-size: 20px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff;
+    box-shadow: 0 5px 16px rgba(15,135,118,.35);
   }
+  header h1 { font-size: 22px; font-weight: 700; letter-spacing: .3px; }
+  header .path { color: var(--muted); font-size: 12.5px; font-family: ui-monospace, monospace; background: var(--card); padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); }
+  header .sub { color: var(--faint); font-size: 12px; margin-left: auto; }
+  .search {
+    width: 100%; padding: 11px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+    background: var(--card-solid); backdrop-filter: blur(12px); font-size: 14px; color: var(--text); outline: none;
+    box-shadow: var(--shadow); transition: border-color .15s, box-shadow .15s; margin-bottom: 4px;
+    position: relative; z-index: 1;
+  }
+  .search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow); }
+  .board { display: flex; gap: 20px; align-items: flex-start; position: relative; z-index: 1; }
+  .groups { flex: 0 0 320px; display: flex; flex-direction: column; gap: 14px; }
   .group {
-    background: var(--card); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-    border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow);
-    padding: 14px; transition: transform .15s;
+    background: var(--card); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 14px; transition: box-shadow .2s;
   }
-  .group:hover { transform: translateY(-1px); }
-  .group h2 { font-size: 13px; color: var(--muted); margin-bottom: 8px; letter-spacing: .4px; text-transform: uppercase; }
+  .group:hover { box-shadow: var(--shadow-lg); }
+  .group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .group h2 { font-size: 12px; color: var(--muted); letter-spacing: .5px; text-transform: uppercase; font-weight: 700; }
+  .group .count { font-size: 11px; color: var(--faint); background: var(--accent-soft); padding: 1px 7px; border-radius: 999px; }
   .script {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 10px; margin: 3px -4px; border-radius: 10px; cursor: pointer;
-    transition: background .15s;
+    display: flex; align-items: center; gap: 10px; padding: 9px 11px; margin: 2px -5px;
+    border-radius: var(--radius-sm); cursor: pointer; transition: background .15s, transform .12s;
   }
-  .script:hover { background: rgba(15,135,118,.09); }
-  .script .sname { font-family: ui-monospace, monospace; font-size: 14px; color: var(--accent); }
-  .script .sdesc { font-size: 11px; color: var(--muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
-  .script.active { background: rgba(15,135,118,.14); }
+  .script:hover { background: var(--accent-soft); }
+  .script:active { transform: scale(.98); }
+  .script .ico { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-size: 15px; background: var(--card-solid); border: 1px solid var(--border); flex-shrink: 0; }
+  .script .stxt { overflow: hidden; }
+  .script .sname { font-family: ui-monospace, monospace; font-size: 13.5px; color: var(--accent); font-weight: 600; }
+  .script .sdesc { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 210px; }
+  .script.active { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--border-strong); }
+  .empty-grp { color: var(--faint); font-size: 12px; font-style: italic; padding: 6px 4px; }
   .detail {
-    flex: 1; background: var(--card); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-    border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow);
-    padding: 22px; min-height: 320px; position: sticky; top: 20px;
+    flex: 1; background: var(--card); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+    border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-lg);
+    padding: 26px; min-height: 380px; position: sticky; top: 20px;
   }
-  .detail .dtitle { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
-  .detail .dpath { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); margin-bottom: 14px; }
-  .detail h3 { font-size: 13px; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .4px; }
-  .detail .ddesc { font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
-  .detail pre.usage { background: rgba(20,70,60,.06); border-radius: 10px; padding: 10px 12px; font-family: ui-monospace,monospace; font-size: 12px; line-height: 1.7; overflow-x: auto; }
+  .detail .d-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  .detail .d-ico { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; font-size: 20px; background: linear-gradient(135deg, var(--accent-soft), rgba(20,165,143,.22)); border: 1px solid var(--border-strong); }
+  .detail .dtitle { font-size: 21px; font-weight: 700; }
+  .detail .dpath { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .detail h3 { font-size: 12px; color: var(--muted); margin: 18px 0 7px; text-transform: uppercase; letter-spacing: .5px; }
+  .detail .ddesc { font-size: 14px; line-height: 1.75; white-space: pre-wrap; color: var(--text); }
+  .detail pre.usage {
+    background: rgba(20,70,60,.06); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 12px 14px; font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.75; overflow-x: auto;
+  }
+  .run-row { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
   .run-btn {
-    margin-top: 18px; padding: 10px 18px; border: none; border-radius: 12px; cursor: pointer;
+    padding: 11px 22px; border: none; border-radius: var(--radius-sm); cursor: pointer;
     background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; font-size: 14px; font-weight: 600;
-    box-shadow: 0 4px 14px rgba(15,135,118,.3); transition: filter .15s, transform .1s;
+    box-shadow: 0 5px 16px rgba(15,135,118,.32); transition: filter .15s, transform .1s;
   }
-  .run-btn:hover { filter: brightness(1.08); }
-  .run-btn:active { transform: scale(.97); }
+  .run-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+  .run-btn:active { transform: scale(.96); }
+  .run-btn:disabled { opacity: .6; cursor: not-allowed; transform: none; }
+  .run-hint { font-size: 12px; color: var(--faint); }
   .output {
-    margin-top: 16px; background: #12231f; color: #c9efe6; border-radius: 12px; padding: 14px;
-    font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap;
-    max-height: 340px; overflow-y: auto; display: none;
+    margin-top: 18px; background: #10231f; color: #cdf0e7; border-radius: var(--radius-sm);
+    padding: 16px; font-family: ui-monospace, monospace; font-size: 12.5px; line-height: 1.65; white-space: pre-wrap;
+    max-height: 360px; overflow-y: auto; border: 1px solid rgba(0,0,0,.2); display: none; box-shadow: inset 0 2px 10px rgba(0,0,0,.2);
   }
-  .output.show { display: block; }
-  .err { color: #ffb4b4; }
-  .empty { color: var(--muted); font-style: italic; font-size: 14px; }
+  .output.show { display: block; animation: fadein .2s ease; }
+  .output.err { border-left: 3px solid var(--danger); }
+  .output.err::before { content: '[exit ≠ 0] ⚠\a'; color: #ffb4b4; font-weight: 700; }
+  .meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+  .placeholder { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 300px; gap: 14px; color: var(--muted); }
+  .placeholder .big { font-size: 52px; opacity: .5; }
+  @keyframes fadein { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: none; } }
+  /* 分组内脚本图标用类型 emoji */
 </style>
 </head>
 <body>
 <header>
+  <div class="logo">⚡</div>
   <h1>gtlx-sh 脚本索引</h1>
   <span class="path" id="base-path"></span>
+  <span class="sub" id="stat"></span>
 </header>
+<input class="search" id="search" placeholder="🔍 过滤脚本名或说明…" oninput="filterScripts(this.value)">
+
 <div class="board">
   <div class="groups" id="groups"></div>
   <div class="detail" id="detail">
-    <div class="empty">← 从左侧选择一个脚本查看说明</div>
+    <div class="placeholder">
+      <div class="big">🗂️</div>
+      <div>← 从左侧选择一个脚本查看说明</div>
+    </div>
   </div>
 </div>
 
 <script>
-let scripts = [];  // 扁平列表供查找
+let scripts = [];
+
+const GROUP_ICON = {
+  'detection': '🛠️', '检测': '🛠️', 'DETECTION': '🛠️',
+  'ocr': '📸', 'OCR': '📸',
+  'backup': '💾', '备份': '💾', 'BACKUP': '💾',
+  'web-index': '🌐', 'WEB-INDEX': '🌐',
+  '根目录': '🗂️'
+};
+const NAME_ICON = {
+  'coc': '🧹', 'systemctl-analysis': '💡', 'pkg-audit': '📦', 'syscheck': '🩺',
+  'ocr': '🔤', 'ocrshot': '🖼️',
+  'restic-backup': '🗄️', 'server-backup.sh': '🌍',
+  'appimage': '📦', 'gitpush': '🚀', 'start.sh': '▶️'
+};
+const ico = s => NAME_ICON[s.name] || GROUP_ICON[s.group] || '📄';
 
 async function load() {
   const res = await fetch('/api/scripts');
   const data = await res.json();
   document.getElementById('base-path').textContent = data.path;
+  const total = Object.values(data.groups).flat().length;
+  document.getElementById('stat').textContent = `${total} 个脚本 · ${Object.keys(data.groups).length} 组`;
   const box = document.getElementById('groups');
   box.innerHTML = '';
   scripts = [];
   for (const [group, items] of Object.entries(data.groups)) {
     const g = document.createElement('div');
-    g.className = 'group';
-    g.innerHTML = `<h2>${group}</h2>`;
-    for (const s of items) {
-      s.group = group;
-      scripts.push(s);
-      const d = document.createElement('div');
-      d.className = 'script';
-      d.dataset.name = s.name;
-      d.innerHTML = `<div><div class="sname">${s.name}</div><div class="sdesc"></div></div>`;
-      g.appendChild(d);
-      d.addEventListener('click', () => select(s, d));
-    }
+    g.className = 'group'; g.dataset.group = group;
+    let head = `<div class="group-head"><span>${GROUP_ICON[group]||'📁'}</span><h2>${group}</h2><span class="count">${items.length}</span></div>`;
+    let body = items.map(s => {
+      s.group = group; scripts.push(s);
+      return `<div class="script" data-script="${s.name}" data-group="${group}">
+        <div class="ico">${ico(s)}</div>
+        <div class="stxt"><div class="sname">${s.name}</div><div class="sdesc"></div></div></div>`;
+    }).join('');
+    g.innerHTML = head + body;
     box.appendChild(g);
+    g.querySelectorAll('.script').forEach(el => {
+      const item = items.find(x => x.name === el.dataset.script);
+      el.querySelector('.sdesc').textContent = item.desc.split('\n')[0] || item.title;
+      el.addEventListener('click', () => select(item, el));
+    });
   }
+}
+
+function filterScripts(q) {
+  q = q.toLowerCase();
+  document.querySelectorAll('.group').forEach(g => {
+    let visible = 0;
+    g.querySelectorAll('.script').forEach(el => {
+      const s = scripts.find(x => x.name === el.dataset.script && x.group === el.dataset.group);
+      const match = !q || (s && `${s.name} ${s.desc} ${s.title}`.toLowerCase().includes(q));
+      el.style.display = match ? '' : 'none';
+      if (match) visible++;
+    });
+    // 隐藏整个分组若无匹配
+    g.style.display = visible ? '' : 'none';
+  });
 }
 
 function select(s, el) {
   document.querySelectorAll('.script').forEach(x => x.classList.remove('active'));
   el.classList.add('active');
   const d = document.getElementById('detail');
+  const groupLabel = s.group === '根目录' ? '' : `${s.group}/`;
   d.innerHTML = `
-    <div class="dtitle">${s.title}</div>
-    <div class="dpath">${s.group}/${s.name}</div>
+    <div class="d-head">
+      <div class="d-ico">${ico(s)}</div>
+      <div><div class="dtitle">${s.title}</div>
+      <div class="dpath">${groupLabel}${s.name}</div></div>
+    </div>
     ${s.desc ? `<h3>说明</h3><div class="ddesc">${s.desc}</div>` : ''}
     ${s.usage.length ? `<h3>用法示例</h3><pre class="usage">${s.usage.join('\n')}</pre>` : ''}
-    <button class="run-btn" id="run-btn">▶ 运行</button>
+    <div class="run-row">
+      <button class="run-btn" id="run-btn">▶ 运行</button>
+      <span class="run-hint">在本机执行该脚本（可在终端查看结果）</span>
+    </div>
     <div class="output" id="output"></div>`;
-  document.getElementById('run-btn').addEventListener('click', () => run(s));
+  document.getElementById('run-btn').addEventListener('click', () => run(s, groupLabel));
 }
 
-async function run(s) {
+async function run(s, groupLabel) {
   const out = document.getElementById('output');
   const btn = document.getElementById('run-btn');
-  out.classList.add('show');
-  out.textContent = '运行中…';
-  btn.disabled = true; btn.textContent = '运行中…';
+  out.classList.add('show'); out.className = 'output show';
+  out.textContent = '⏳ 运行中…';
+  btn.disabled = true; btn.textContent = '⏳ 运行中…';
   try {
     const res = await fetch('/api/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: s.group === '根目录' ? s.name : `${s.group}/${s.name}` })
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: groupLabel + s.name })
     });
     const data = await res.json();
-    out.className = 'output show' + (data.exit !== 0 ? ' err' : '');
-    out.textContent = (data.stderr ? `[stderr]\n${data.stderr}\n\n` : '') + (data.stdout || '(无输出)');
+    out.className = 'output show' + (data.exit !== 0 && data.exit !== -1 ? ' err' : '');
+    const head = data.exit === -1 ? '⏱️ 已超时（60s）\n\n' : '';
+    const err = data.stderr ? `[stderr]\n${data.stderr}\n\n` : '';
+    out.textContent = head + err + (data.stdout || '(无输出)');
   } catch (e) {
     out.className = 'output show err';
     out.textContent = '运行失败: ' + e;

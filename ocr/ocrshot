@@ -37,9 +37,15 @@ else
   MODE="区域"
 fi
 
-# 2. 预览标注（satty），取消或无有效标注则退出
-# 显式指定输入/输出, 避免依赖全局 satty config 的 output-filename 存到家目录
-if ! satty --filename "$RAW" --output-filename "$FINAL" --early-exit --action-on-enter="save-to-file" >/dev/null 2>&1; then
+# 2. 预览标注（satty），显式指定路径+体验参数, 不依赖全局配置
+#   --initial-tool=arrow  默认箭头(最常用标注)
+#   --corner-roundness=14 圆角标注
+#   --annotation-size-factor=1.05 适度标注尺寸
+#   --auto-copy           标注后自动复制到剪贴板
+if ! satty --filename "$RAW" --output-filename "$FINAL" --early-exit \
+     --action-on-enter="save-to-file" \
+     --initial-tool=arrow --corner-roundness=14 --annotation-size-factor=1.05 \
+     >/dev/null 2>&1; then
   echo "已取消标注"
   rm -f "$RAW"
   exit 1

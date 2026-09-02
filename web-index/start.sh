@@ -19,5 +19,7 @@ if [ ! -x "$DIR/.venv/bin/uvicorn" ]; then
 fi
 
 echo "→ gtlx-sh 脚本索引: http://127.0.0.1:$PORT"
+# 起服务后自动打开浏览器(后台,不阻塞服务)
+( sleep 0.5; xdg-open "http://127.0.0.1:$PORT" >/dev/null 2>&1 ) &
 cd "$DIR"
 exec "$DIR/.venv/bin/uvicorn" app:app --host 127.0.0.1 --port "$PORT"

@@ -1,6 +1,37 @@
 # gtlx-sh
 
-个人常用脚本集合。
+个人常用脚本集合。按**文件夹分类**，每个脚本独立文件，Git 版本管理，AGPL-3.0 许可。
+
+```
+gtlx-sh/
+  appimage, coc, systemctl-analysis, gitpush   ← 根目录: 单脚本工具
+  ocr/                                         ← 分类目录: 截图识别(ocr, ocrshot)
+  ...
+```
+
+`~/.local/bin/` 中的命令是**软链接**，指向本目录脚本真身。改脚本请改这里（git 管理、可回退），不要改 `~/.local/bin` 里的软链。
+
+---
+
+## ocr/ — 截图识别（OCR）
+
+Wayland 截图即文字识别，串 grim + slurp + satty + rapidocr。
+
+### ocr — 图片文字识别 CLI
+```bash
+ocr                     # 识别 ~/Pictures/ScreenShot/ 最新截图
+ocr 图片.png            # 识别指定文件
+ocr --clipboard         # 识别剪贴板图片
+ocr --clipboard-txt     # 读剪贴板文本
+```
+
+### ocrshot — 截图即识别（区域/整屏 → 标注 → OCR → 复制）
+```bash
+ocrshot            # 框选区域 → satty 标注 → OCR → 复制
+ocrshot --full     # 整屏截图 → 同流程
+```
+- niri 快捷键：`Ctrl+Alt+A`(区域) / `Ctrl+Alt+Shift+A`(整屏)
+- 配置：`~/.config/ocrshot/config`，`SHOT_DIR` 设保存目录（默认 `~/Pictures/ScreenShot/ocr`，**别用 `~`**）
 
 ---
 

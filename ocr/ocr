@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 gtlx
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ocr — 图片文字识别 CLI
+# 用法:
+#   ocr                    识别 ~/Pictures/ScreenShot/ 下最新的截图
+#   ocr 图片.png           识别指定文件
+#   ocr --clipboard        识别剪贴板里的图片
+#   ocr --clipboard-txt    读剪贴板文本后写入文件再识别(极少用,保留)
+# 识别结果: 打印到终端 + 复制进剪贴板(wl-copy)
+set -euo pipefail
+
+VENV=/home/gtlx/.venvs/ocr/bin
+SHOT_DIR="$HOME/Pictures/ScreenShot"
+IMAGE=""
+MODE=""
+
+# ---- 解析参数 ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clipboard|-c) MODE="clipboard"; shift ;;
+    --clipboard-txt|-t) MODE="clipboard-txt"; shift ;;
+    *) IMAGE="$1"; shift ;;
+  esac
+done
+
+if [ "$MODE" = "clipboard" ]; then
+  # 从剪贴板存图
+  TMP=$(mktemp --suffix=.png)
+  wl-paste --type image/png > "$TMP" 2>/dev/null || { echo "✗ 剪贴板里没有图片"; rm -f "$TMP"; exit 1; }
+  IMAGE="$TMP"
+elif [ "$MODE" = "clipboard-txt" ]; then
+  TMP=$(mktemp --suffix=.txt)
+  wl-paste > "$TMP" 2>/dev/null || { echo "✗ 剪贴板为空"; rm -f "$TMP"; exit 1; }
+  IMAGE="$TMP"
+elif [ -z "$IMAGE" ]; then
+  # 无参数: 取最新截图
+  IMAGE=$(ls -t "$SHOT_DIR"/*.png 2>/dev/null | head -1 || true)
+  if [ -z "$IMAGE" ]; then
+    echo "✗ 没找到截图. 请先按 PrtSc 截图, 或用: ocr <图片路径>"
+    exit 1
+  fi
+  echo "→ 使用最新截图: $(basename "$IMAGE")"
+fi
+
+[ -f "$IMAGE" ] || { echo "✗ 文件不存在: $IMAGE"; exit 1; }
+
+# ---- OCR ----
+OUT=$("$VENV/python" - "$IMAGE" <<'PY'
+import sys
+from rapidocr_onnxruntime import RapidOCR
+ocr = RapidOCR()
+res, _ = ocr(sys.argv[1])
+if not res:
+    print("(未识别到文字)", end="")
+    sys.exit(0)
+# 按纵坐标分组排序, 还原阅读顺序
+rows = sorted(res, key=lambda r: (round(r[0][0][1]/20), r[0][0][0]))
+lines, cur = [], None
+for box, text, conf in rows:
+    y = box[0][1]
+    if cur is None or y > cur + 20:
+        cur = y
+        lines.append(text)
+    else:
+        lines[-1] += (" " if lines[-1] else "") + text
+print("\n".join(l for l in lines if l))
+PY
+)
+
+echo "======================"
+echo "$OUT"
+echo "======================"
+
+# 复制进剪贴板(保留原始换行, 去首尾空行)
+printf '%s' "$OUT" | sed '/^$/d' | wl-copy
+echo "✓ 已复制到剪贴板"
+
+# 清理临时文件
+[ "$MODE" = "clipboard" ] && rm -f "$IMAGE"
+[ "$MODE" = "clipboard-txt" ] && rm -f "$IMAGE"

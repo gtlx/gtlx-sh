@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2026 gtlx
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# ocrshot — 截图即识别（grim + slurp + satty + rapidocr）
+#   ocrshot          = 框选区域 → 预览标注 → 保存 → 识别文字复制
+#   ocrshot --full   = 整屏截图 → 预览标注 → 保存 → 识别文字复制
+#
+# 配置文件: ~/.config/ocrshot/config
+#   SHOT_DIR  存图目录(默认 ~/Pictures/ocr)
+#   OCR_FULL  截图后立即识别(1) 还是留给预览(0)
+set -euo pipefail
+
+CFG="$HOME/.config/ocrshot/config"
+if [ -f "$CFG" ]; then
+  source "$CFG"
+fi
+SHOT_DIR="${SHOT_DIR:-$HOME/Pictures/ocr}"
+mkdir -p "$SHOT_DIR"
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+RAW="$SHOT_DIR/.raw-$STAMP.png"
+FINAL="$SHOT_DIR/$STAMP.png"
+
+# 1. 截图
+if [ "${1:-}" = "--full" ]; then
+  grim "$RAW"
+  MODE="整屏"
+else
+  geometry=$(slurp 2>/dev/null || true)
+  if [ -z "$geometry" ]; then
+    echo "已取消"
+    exit 1
+  fi
+  grim -g "$geometry" "$RAW"
+  MODE="区域"
+fi
+
+# 2. 预览标注（satty），取消或无有效标注则退出
+# 显式指定输入/输出, 避免依赖全局 satty config 的 output-filename 存到家目录
+if ! satty --filename "$RAW" --output-filename "$FINAL" --early-exit --action-on-enter="save-to-file" >/dev/null 2>&1; then
+  echo "已取消标注"
+  rm -f "$RAW"
+  exit 1
+fi
+rm -f "$RAW"
+
+if [ ! -f "$FINAL" ]; then
+  echo "未保存截图"
+  exit 1
+fi
+echo "✓ 已保存: $FINAL ($MODE)"
+
+# 3. 识别 — 用同目录下的 ocr（软链到 gtlx-sh/ocr 时, 解析真实路径定位）
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+OCR="$SELF_DIR/ocr"
+if [ -x "$OCR" ]; then
+  "$OCR" "$FINAL" 2>/dev/null | tail -n +2  # 去掉"使用最新截图"那行, 直接给识别结果
+else
+  echo "(未找到同目录 ocr, 已跳过识别)"
+fi

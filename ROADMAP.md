@@ -29,13 +29,13 @@ gtlx-sh/
 
 **本期后：重复消失，脚本归位，git 统一管理**
 
-- [ ] 建立 `detection/`、`backup/` 分类目录
-- [ ] 把 `~/.local/bin/health/{coc,pkg-audit,systemctl-analysis}` 与 `gtlx-sh/` 里同名脚本**比对 → 取最新/合并 → 归入 `detection/`**
-- [ ] 处理 `appimage`（gtlx-sh 与 ~/.local/bin 曾 md5 不同，比对合版）
-- [ ] `syscheck`（~/.local/bin 的体检调度器）保留作入口，改指 `detection/` 脚本
-- [ ] `backup/` 收编 `restic-backup`、`server-backup.sh`
-- [ ] `~/.local/bin` 全部换软链 + 清理 .bak
-- [ ] README 更新目录结构
+- [x] 建立 `detection/`、`backup/` 分类目录
+- [x] 把 `~/.local/bin/health/{coc,pkg-audit,systemctl-analysis}` 与 `gtlx-sh/` 里同名脚本**比对 → 取最新/合并 → 归入 `detection/`**
+- [x] 处理 `appimage`（gtlx-sh 与 ~/.local/bin 曾 md5 不同，比对合版）
+- [x] `syscheck`（~/.local/bin 的体检调度器）保留作入口，改指 `detection/` 脚本
+- [x] `backup/` 收编 `restic-backup`、`server-backup.sh`
+- [x] `~/.local/bin` 全部换软链 + 清理 .bak
+- [x] README 更新目录结构
 
 **验收**：`git grep` 无重复脚本；全部命令经软链可用；`syscheck` 能调 detection/ 模块
 

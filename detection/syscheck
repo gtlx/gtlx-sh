@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ============================================================================
+# syscheck — 系统体检总入口(模块化调度器)
+# 统一一个命令,内嵌各体检模块,按需调用,不需逐次询问。
+#
+# 用法:
+#   syscheck                # 全量体检(概况+垃圾+孤儿+健康+内存+包+服务)
+#   syscheck <模块名>        # 单跑一个模块(可叠加: syscheck 垃圾 孤儿)
+#   syscheck --list         # 列出所有可用模块
+#   syscheck --help         # 帮助
+#
+# 模块化:新增模块 = 在 MODULE_* 函数里加一个,再往 MODULES 数组登记即成
+#          (函数名  MODULE_<名> ,MODULES 值 = "名|显示名|说明")
+# 自包含:本脚本内嵌全部模块逻辑,不依赖本机额外脚本(除系统命令)。
+#         各分脚本(coc/pkg-audit/systemctl-analysis 等)若存在则优先调用增强版,
+#         否则回退到内建逻辑,保证任何环境都能跑。
+# ============================================================================
+set -uo pipefail
+
+# ── 定位: 总脚本真实目录(解析软链) + 分脚本在同一目录 ─────────────────
+# syscheck 是体检入口, 分脚本(coc/pkg-audit/systemctl-analysis)与其同目录。
+# 用 readlink -f 解析软链, 使 ~/.local/bin/syscheck -> gtlx-sh/detection/syscheck
+# 无论从哪调用都能正确定位到分脚本。
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+HEALTH_DIR="$SCRIPT_DIR"
+
+# ── 颜色 ──────────────────────────────────────────────────────────────────
+C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
+C_BLU=$'\033[1;34m'; C_CYN=$'\033[1;36m'; C_BLD=$'\033[1m'; C_NC=$'\033[0m'
+hdr()  { echo -e "\n${C_BLD}${C_BLU}══ $1 ${C_NC}"; }
+ok()   { echo -e "  ${C_GRN}✔${C_NC} $1"; }
+warn() { echo -e "  ${C_YEL}⚠${C_NC} $1"; }
+info() { echo -e "  ${C_CYN}ℹ${C_NC} $1"; }
+
+# ── 模块注册表 ────────────────────────────────────────────────────────────
+# 格式: 模块名|显示名|说明
+# 新增模块:写一个 MODULE_<名>() 函数,再在此登记一行即可自动接入 --list/分派
+MODULES=(
+  "overview|概况|OS/内核/负载/内存/zram/磁盘/inode"
+  "garbage|垃圾清理|缓存/coredump/日志/孤包/快照/VM/堆积"
+  "orphan|孤儿配置|~/.config 已卸载软件残留(coc)"
+  "health|健康检查|systemctl失败/journal/定时器/SSD/温度/服务分析"
+  "memory|内存|大内存进程/QEMU暂停"
+  "pkg|包审计|系统vs手动包/可清理项(pkg-audit)"
+)
+
+# ── 模块:概况 ─────────────────────────────────────────────────────────────
+MODULE_overview() {
+  hdr "【1. 系统概况】"
+  uname -r; head -1 /etc/os-release 2>/dev/null; uptime
+  echo "CPU: $(lscpu | grep -iE 'model name|型号名称' | head -1 | awk -F'[：:]' '{print $NF}' | xargs)"
+  free -h | head -2; zramctl 2>/dev/null | head -3
+  hdr "【磁盘占用】"
+  df -h -x tmpfs -x devtmpfs | grep -vE "efivarfs|squashfuse|AppImage"
+  echo "-- inode --"; df -i -x tmpfs -x devtmpfs | grep -vE "efivarfs|squashfuse|AppImage"
+}
+
+# ── 模块:垃圾清理 ──────────────────────────────────────────────────────────
+MODULE_garbage() {
+  hdr "【2. 包管理】"
+  echo "包总数: $(pacman -Q|wc -l) | 显式: $(pacman -Qe|wc -l) | AUR: $(pacman -Qm|wc -l)"
+  echo "待更新: $(pacman -Qu 2>/dev/null|wc -l) | pacman缓存: $(du -sh /var/cache/pacman/pkg 2>/dev/null|cut -f1)"
+  echo "孤包数: $(pacman -Qtdq|wc -l)"; pacman -Qtdq
+  hdr "【3. 缓存类垃圾】"
+  for d in ~/.npm ~/.local/share/pnpm/store ~/.cargo ~/.nvm ~/.cache/uv ~/.cache/paru ~/.local/share/baloo; do
+    [ -e "$d" ] && echo "  $(du -sh "$d" 2>/dev/null|cut -f1)  $d"
+  done
+  hdr "【4. 崩溃转储/日志】"
+  echo "coredump: $(du -sh /var/lib/systemd/coredump 2>/dev/null|cut -f1)"
+  echo "journal: $(journalctl --disk-usage 2>/dev/null|tail -1)"
+  hdr "【5. 快照/备份/VM】"
+  du -sh ~/项目/vmm 2>/dev/null
+  echo "VM进程: $(pgrep -a qemu 2>/dev/null|head -1|cut -c1-80 || echo 无)"
+}
+
+# ── 模块:孤儿配置 ──────────────────────────────────────────────────────────
+MODULE_orphan() {
+  hdr "【6. 孤儿配置 ~/.config】"
+  if [ -x "$HEALTH_DIR/coc" ]; then
+    "$HEALTH_DIR/coc" --json 2>/dev/null || "$HEALTH_DIR/coc"
+  else
+    warn "health/coc 不存在,回退手写判定"
+    cd ~/.config || return
+    for d in */; do n="${d%/}"; lc=$(echo "$n"|tr 'A-Z' 'a-z')
+      if pacman -Q "$lc" >/dev/null 2>&1 || pacman -Qm "$n" >/dev/null 2>&1 || command -v "$lc" >/dev/null 2>&1; then
+        :; else echo "  ? 疑似孤儿: $n"; fi
+    done
+  fi
+}
+
+# ── 模块:健康检查 ──────────────────────────────────────────────────────────
+MODULE_health() {
+  hdr "【7. 健康检查】"
+  echo "-- 失败服务 --"; systemctl --failed --no-legend 2>/dev/null || echo "  无"
+  echo "-- journal本启动错误 --"; journalctl -b -p 3 --no-pager 2>/dev/null | tail -5
+  echo "-- 定时器 --"; systemctl list-timers --no-pager 2>/dev/null | head -6
+  echo "-- SSD --"; for d in /sys/class/nvme/nvme*; do [ -d "$d" ] && echo "  $(cat $d/model 2>/dev/null)  序列号$(cat $d/serial 2>/dev/null)"; done
+  echo "-- 温度 --"; sensors 2>/dev/null | grep -iE "package|composite" | head -4
+  hdr "【深入服务分析】"
+  if [ -x "$HEALTH_DIR/systemctl-analysis" ]; then
+    "$HEALTH_DIR/systemctl-analysis" 2>/dev/null | head -20
+  else
+    warn "health/systemctl-analysis 不存在,仅做快速检查"
+  fi
+}
+
+# ── 模块:内存 ─────────────────────────────────────────────────────────────
+MODULE_memory() {
+  hdr "【8. 内存大户 TOP15】"
+  ps aux --sort=-%mem | head -16 | awk '{printf "  %-8s %5s%% %s\n", $1, $4, substr($0,index($0,$11),90)}'
+  echo "-- 暂停的QEMU(占内存未跑) --"; pgrep -a qemu 2>/dev/null | grep -- " -S " || echo "  无"
+}
+
+# ── 模块:包审计 ───────────────────────────────────────────────────────────
+MODULE_pkg() {
+  hdr "【9. 包审计】"
+  if [ -x "$HEALTH_DIR/pkg-audit" ]; then
+    "$HEALTH_DIR/pkg-audit" 2>/dev/null | head -40
+  else
+    warn "health/pkg-audit 不存在,回退基础信息"
+    echo "显式包: $(pacman -Qe|wc -l) | AUR: $(pacman -Qm|wc -l) | 孤包: $(pacman -Qtdq|wc -l)"
+  fi
+}
+
+# ── 帮助/列表 ─────────────────────────────────────────────────────────────
+list_modules() {
+  echo -e "${C_BLD}可用体检模块:${C_NC}"
+  for m in "${MODULES[@]}"; do
+    IFS='|' read -r name label desc <<< "$m"
+    printf "  ${C_CYN}%-10s${C_NC} %s — %s\n" "$name" "$label" "$desc"
+  done
+  echo -e "\n用法: syscheck [模块名...] | --list | --help   (无参=全量)"
+}
+show_help() {
+  echo "syscheck — 系统体检总入口(模块化)"
+  echo "用法:"
+  echo "  syscheck                全量体检(所有模块)"
+  echo "  syscheck 模块名...      单跑指定模块,可叠加(例: syscheck garbage orphan)"
+  echo "  syscheck --list         列出所有模块"
+  echo "  syscheck --help         本帮助"
+  echo
+  list_modules
+}
+
+# ── 主分派 ────────────────────────────────────────────────────────────────
+[[ $# -eq 0 ]] && set -- all
+case "$1" in
+  --list|-l) list_modules; exit 0;;
+  --help|-h) show_help; exit 0;;
+esac
+
+run_module() {  # run_module <name> — 按名字调用对应 MODULE_<name> 函数
+  local name="$1"
+  case "$name" in
+    all)
+      for m in "${MODULES[@]}"; do
+        local mod="${m%%|*}"; run_module "$mod"
+      done
+      ;;
+    *)
+      if declare -F "MODULE_$name" >/dev/null 2>&1; then
+        "MODULE_$name"
+      else
+        warn "未知模块: $name (用 --list 查看)"
+        return 1
+      fi
+      ;;
+  esac
+}
+
+for arg in "$@"; do
+  run_module "$arg"
+done
+
+echo -e "\n${C_GRN}══ 体检完成 ${C_NC}"

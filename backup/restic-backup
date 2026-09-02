@@ -1,0 +1,39 @@
+#!/bin/bash
+# restic 备份脚本 —— 源列表 + 排除规则集中管理
+# 加文件夹 = 在 SOURCES 里加一行；不想备份某目录 = 在 EXCLUDES 加一行
+# 用法：restic-backup            （备份）
+#       RESTIC_REPOSITORY=s3:... restic-backup   （备份到对象存储，环境变量覆盖）
+set -euo pipefail
+
+export RESTIC_PASSWORD_FILE="$HOME/.config/restic/repo-password"
+# 默认本地仓库；云端后：export RESTIC_REPOSITORY='s3:https://<endpoint>/<bucket>/home-backup'
+export RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-$HOME/.backups/restic-local}"
+
+# ── 备份源（加文件夹就在这加一行）──────────────────────
+SOURCES=(
+  "$HOME/文档"
+  "$HOME/Pictures"
+  "$HOME/Videos"
+  "$HOME/Music"
+  "$HOME/.hermes"
+  "$HOME/.config"
+  "$HOME/.ssh"
+  "$HOME/.local/share"
+  "$HOME/项目"
+)
+
+# ── 排除规则（构建产物/缓存/虚拟镜像，可再生的不备份）──────
+EXCLUDES=(
+  --exclude '/home/gtlx/项目/vmm'
+  --exclude '**/.cache'
+  --exclude '**/node_modules'
+  --exclude '**/target'
+  --exclude '**/dist'
+  --exclude '**/.git'
+  --exclude '**/build'
+  --exclude '**/.next'
+  --exclude '**/*.qcow2'
+  --exclude '**/__pycache__'
+)
+
+restic backup "${SOURCES[@]}" "${EXCLUDES[@]}"

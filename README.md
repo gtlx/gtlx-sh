@@ -4,8 +4,10 @@
 
 ```
 gtlx-sh/
-  appimage, coc, systemctl-analysis, gitpush   ← 根目录: 单脚本工具
-  ocr/                                         ← 分类目录: 截图识别(ocr, ocrshot)
+  appimage, gitpush                     ← 根目录: 单脚本工具
+  detection/                            ← 检测类: coc, pkg-audit, systemctl-analysis, syscheck
+  ocr/                                  ← 截图识别: ocr, ocrshot
+  backup/                               ← 备份类: restic-backup, server-backup.sh
   ...
 ```
 

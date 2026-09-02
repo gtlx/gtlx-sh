@@ -1,0 +1,4 @@
+# Python venv / 运行时
+web-index/.venv/
+__pycache__/
+*.pyc

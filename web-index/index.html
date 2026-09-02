@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gtlx-sh 脚本索引</title>
+<style>
+  :root {
+    --bg1: #ecf4f1; --bg2: #dbeae4;
+    --card: rgba(255,255,255,.55); --border: rgba(255,255,255,.6);
+    --text: #173b34; --muted: #5d7a72;
+    --accent: #0f8776; --accent2: #14a58f;
+    --danger: #d64545; --shadow: 0 8px 30px rgba(20,70,60,.12);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, "LXGW WenKai", "PingFang SC", sans-serif;
+    background: linear-gradient(135deg, var(--bg1), var(--bg2));
+    min-height: 100vh; color: var(--text); padding: 28px;
+  }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 22px; }
+  header h1 { font-size: 22px; letter-spacing: .3px; }
+  header span.path { color: var(--muted); font-size: 13px; }
+  .board {
+    display: flex; gap: 18px; align-items: flex-start;
+  }
+  .groups {
+    flex: 0 0 300px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .group {
+    background: var(--card); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow);
+    padding: 14px; transition: transform .15s;
+  }
+  .group:hover { transform: translateY(-1px); }
+  .group h2 { font-size: 13px; color: var(--muted); margin-bottom: 8px; letter-spacing: .4px; text-transform: uppercase; }
+  .script {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 10px; margin: 3px -4px; border-radius: 10px; cursor: pointer;
+    transition: background .15s;
+  }
+  .script:hover { background: rgba(15,135,118,.09); }
+  .script .sname { font-family: ui-monospace, monospace; font-size: 14px; color: var(--accent); }
+  .script .sdesc { font-size: 11px; color: var(--muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+  .script.active { background: rgba(15,135,118,.14); }
+  .detail {
+    flex: 1; background: var(--card); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow);
+    padding: 22px; min-height: 320px; position: sticky; top: 20px;
+  }
+  .detail .dtitle { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+  .detail .dpath { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+  .detail h3 { font-size: 13px; color: var(--muted); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .4px; }
+  .detail .ddesc { font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
+  .detail pre.usage { background: rgba(20,70,60,.06); border-radius: 10px; padding: 10px 12px; font-family: ui-monospace,monospace; font-size: 12px; line-height: 1.7; overflow-x: auto; }
+  .run-btn {
+    margin-top: 18px; padding: 10px 18px; border: none; border-radius: 12px; cursor: pointer;
+    background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; font-size: 14px; font-weight: 600;
+    box-shadow: 0 4px 14px rgba(15,135,118,.3); transition: filter .15s, transform .1s;
+  }
+  .run-btn:hover { filter: brightness(1.08); }
+  .run-btn:active { transform: scale(.97); }
+  .output {
+    margin-top: 16px; background: #12231f; color: #c9efe6; border-radius: 12px; padding: 14px;
+    font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap;
+    max-height: 340px; overflow-y: auto; display: none;
+  }
+  .output.show { display: block; }
+  .err { color: #ffb4b4; }
+  .empty { color: var(--muted); font-style: italic; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gtlx-sh 脚本索引</h1>
+  <span class="path" id="base-path"></span>
+</header>
+<div class="board">
+  <div class="groups" id="groups"></div>
+  <div class="detail" id="detail">
+    <div class="empty">← 从左侧选择一个脚本查看说明</div>
+  </div>
+</div>
+
+<script>
+let scripts = [];  // 扁平列表供查找
+
+async function load() {
+  const res = await fetch('/api/scripts');
+  const data = await res.json();
+  document.getElementById('base-path').textContent = data.path;
+  const box = document.getElementById('groups');
+  box.innerHTML = '';
+  scripts = [];
+  for (const [group, items] of Object.entries(data.groups)) {
+    const g = document.createElement('div');
+    g.className = 'group';
+    g.innerHTML = `<h2>${group}</h2>`;
+    for (const s of items) {
+      s.group = group;
+      scripts.push(s);
+      const d = document.createElement('div');
+      d.className = 'script';
+      d.dataset.name = s.name;
+      d.innerHTML = `<div><div class="sname">${s.name}</div><div class="sdesc"></div></div>`;
+      g.appendChild(d);
+      d.addEventListener('click', () => select(s, d));
+    }
+    box.appendChild(g);
+  }
+}
+
+function select(s, el) {
+  document.querySelectorAll('.script').forEach(x => x.classList.remove('active'));
+  el.classList.add('active');
+  const d = document.getElementById('detail');
+  d.innerHTML = `
+    <div class="dtitle">${s.title}</div>
+    <div class="dpath">${s.group}/${s.name}</div>
+    ${s.desc ? `<h3>说明</h3><div class="ddesc">${s.desc}</div>` : ''}
+    ${s.usage.length ? `<h3>用法示例</h3><pre class="usage">${s.usage.join('\n')}</pre>` : ''}
+    <button class="run-btn" id="run-btn">▶ 运行</button>
+    <div class="output" id="output"></div>`;
+  document.getElementById('run-btn').addEventListener('click', () => run(s));
+}
+
+async function run(s) {
+  const out = document.getElementById('output');
+  const btn = document.getElementById('run-btn');
+  out.classList.add('show');
+  out.textContent = '运行中…';
+  btn.disabled = true; btn.textContent = '运行中…';
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: s.group === '根目录' ? s.name : `${s.group}/${s.name}` })
+    });
+    const data = await res.json();
+    out.className = 'output show' + (data.exit !== 0 ? ' err' : '');
+    out.textContent = (data.stderr ? `[stderr]\n${data.stderr}\n\n` : '') + (data.stdout || '(无输出)');
+  } catch (e) {
+    out.className = 'output show err';
+    out.textContent = '运行失败: ' + e;
+  } finally {
+    btn.disabled = false; btn.textContent = '▶ 运行';
+  }
+}
+
+load();
+</script>
+</body>
+</html>

@@ -5,13 +5,31 @@
 ```
 gtlx-sh/
   appimage, gitpush                     ← 根目录: 单脚本工具
-  detection/                            ← 检测类: coc, pkg-audit, systemctl-analysis, syscheck
+  detection/                            ← 检测类: coc, pkg-audit, systemctl-analysis, syscheck, repo-health
   ocr/                                  ← 截图识别: ocr, ocrshot
   backup/                               ← 备份类: restic-backup, server-backup.sh
   ...
 ```
 
 `~/.local/bin/` 中的命令是**软链接**，指向本目录脚本真身。改脚本请改这里（git 管理、可回退），不要改 `~/.local/bin` 里的软链。
+
+---
+
+## detection/repo-health — 仓库健康体检（防屎山）
+
+一条命令出四数字，与上次基准对比，防止项目越做越胖。
+
+```bash
+repo-health ~/项目/code/qianxiang          # 打印表格，有基准则自动对比
+repo-health ~/项目/code/qianxiang --save    # 固化本次数字为首版/新基准
+repo-health ~/项目/code/Fikee --json        # 机器可读
+```
+
+- 四指标：代码行数（按语言，排除 target/build/.dart_tool/node_modules/生成物）、直接依赖数（Cargo/pubspec/package.json/go.mod 分清单算）、最大单文件行数 top5、重复块 top3（12 行窗口、空白归一化、相邻窗口合并成块）
+- 判定：任一数字↑标 `回归（需功能性理由）`，↓标下降，= 持平；整仓 0.1~0.2 秒，退出码恒 0（体检不是门禁）
+- 基准缓存：`~/.local/state/repo-health/<目录名 sha1 前8位>-<目录名>.json`，**不写进被测仓库工作区**
+- 局限：行数是物理行（含空行注释）；重复块只查顺序一致、跨不过空行，改名的复制粘不住；>300KB 文件跳过重复检测（仍计行数）；上限 4000 文件/20s，超限会打印「已截断」
+- 用法约定：交接快照与版本定稿都跑它，数字写进快照（轻量门）；定稿再叠 `ponytail-audit` 全仓读代码（重门）
 
 ---
 

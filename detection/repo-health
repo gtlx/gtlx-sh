@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# repo-health — 仓库健康体检 CLI（零第三方依赖，仅 Python3 标准库）
+#
+# Copyright (C) 2026 gtlx
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# 四个指标（全部真实计算，不估算）：
+#   1. 代码行数：按语言累计物理行数，排除构建/依赖目录与生成文件
+#   2. 直接依赖数：解析 Cargo.toml / pubspec.yaml / package.json / go.mod
+#   3. 最大单文件行数 top5
+#   4. 重复块 top3：自实现窗口哈希（连续 12 行有效代码），合并相邻重复窗口
+#
+# 用法：
+#   repo-health <仓库路径>            打印中文体检表
+#   repo-health <仓库路径> --json     机器可读 JSON
+#   repo-health <仓库路径> --save     把本次四数字写入基准缓存
+#   repo-health <仓库路径> --compare  与基准缓存对比（默认有基准就自动对比）
+#
+# 基准位置：~/.local/state/repo-health/<目录名sha1前8位>-<目录名>.json
+# 绝不写入被测仓库工作区。
+#
+# 退出码永远为 0（体检是信息工具，不是门禁）。
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import time
+from datetime import datetime
+
+# ---------------------------------------------------------------- 配置常量
+
+# 排除目录：构建产物、依赖、IDE 缓存、第三方代码
+EXCLUDE_DIRS = {
+    ".git", "target", "build", "dist", "node_modules", ".dart_tool",
+    ".gradle", ".venv", "venv", "vendor", "third_party", "__pycache__",
+    "coverage", ".idea", ".vscode",
+}
+
+# 语言扩展名映射（配置类 .toml/.yaml/.json 不计入代码行数）
+LANG_BY_EXT = {
+    ".rs": "Rust",
+    ".dart": "Dart",
+    ".go": "Go",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript(TSX)",
+    ".js": "JavaScript",
+    ".py": "Python",
+    ".kt": "Kotlin",
+    ".swift": "Swift",
+    ".sh": "Shell",
+    ".html": "HTML",
+    ".css": "CSS",
+    ".scss": "SCSS",
+    ".vue": "Vue",
+    ".sql": "SQL",
+}
+
+# 生成物：不计入行数，也不参与重复检测
+GENERATED_RE = re.compile(
+    r"(?:\.g\.dart|\.freezed\.dart|\.min\.js|\.lock|_generated\.[\w.]+"
+    r"|\.gen\.[\w.]+|\.mocks\.dart|\.gr\.dart|\.config\.dart)$"
+)
+
+MAX_DUP_FILE_BYTES = 300 * 1024   # 重复检测跳过 >300KB 文件
+MAX_FILES = 4000                  # 最多扫描 4000 个源码文件
+TIME_BUDGET = 20.0                # 整体时间预算（秒）
+DUP_WINDOW = 12                   # 重复窗口行数
+MIN_LINE_LEN = 10                 # 参与重复检测的行最小长度（去空白后）
+MAX_OCC_PER_HASH = 40             # 每个哈希最多保留的扩展起点（防爆炸）
+MAX_DUP_GROUPS = 3000             # 最多处理多少个重复哈希组
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "repo-health",
+)
+
+PACKAGE_DIR_NAMES = {
+    "frontend", "frontend_flutter", "panel", "webui", "web", "ui",
+    "desktop", "gui", "client", "app",
+}
+
+
+# ---------------------------------------------------------------- 工具函数
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_int(n):
+    return "{:,}".format(int(n))
+
+
+def walk_repo(root, deadline):
+    """遍历仓库，返回 (源码文件列表, 清单文件列表, 截断原因列表)。
+
+    源码文件用 (绝对路径, 扩展名) 表示；清单文件用 (kind, 路径) 表示。
+    """
+    src_files = []
+    manifests = []
+    trunc = []
+    manifest_names = {"Cargo.toml": "cargo", "pubspec.yaml": "pubspec",
+                      "package.json": "package_json", "go.mod": "go"}
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            if time.monotonic() > deadline:
+                trunc.append("遍历因 20 秒预算中止（结果仅含已遍历部分）")
+                break
+            # 剪枝：排除目录（同时剪掉 .git 等隐藏构建目录）
+            keep = []
+            for d in dirnames:
+                if d in EXCLUDE_DIRS:
+                    continue
+                keep.append(d)
+            dirnames[:] = keep
+
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                ext = os.path.splitext(fn)[1].lower()
+
+                kind = manifest_names.get(fn)
+                if kind:
+                    parent = os.path.basename(dirpath).lower()
+                    # package.json 只认真实包目录或仓库根，不扫 node_modules
+                    if kind == "package_json":
+                        is_root = os.path.abspath(dirpath) == os.path.abspath(root)
+                        if not is_root and parent not in PACKAGE_DIR_NAMES:
+                            continue
+                    manifests.append((kind, full))
+                    # 清单本身也可能是源码（如 .py），继续走下面逻辑无碍
+
+                if ext in LANG_BY_EXT and not GENERATED_RE.search(fn):
+                    if len(src_files) >= MAX_FILES:
+                        if not trunc:
+                            trunc.append("源码文件数超过 %d，仅统计前 %d 个" %
+                                         (MAX_FILES, MAX_FILES))
+                        continue
+                    src_files.append((full, ext))
+    except (PermissionError, OSError) as e:
+        trunc.append("遍历中断：%s" % e)
+    # 稳定排序，保证两次运行数字一致
+    src_files.sort(key=lambda x: x[0])
+    manifests.sort(key=lambda x: x[1])
+    return src_files, manifests, trunc
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return data.decode("utf-8", "ignore")
+    except (OSError, PermissionError):
+        return ""
+
+
+def count_lines(data):
+    """物理行数：换行符数 + 末行无换行补 1。"""
+    n = data.count(b"\n")
+    if data and not data.endswith(b"\n"):
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------- 指标 1：代码行数
+
+def metric_lines(root, src_files, trunc, deadline):
+    lang_lines = {}
+    lang_files = {}
+    total = 0
+    big_files_skipped = []
+    file_sizes = []
+
+    for full, ext in src_files:
+        if time.monotonic() > deadline:
+            trunc.append("行数统计因 20 秒预算中止（结果仅含已处理文件）")
+            break
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except (OSError, PermissionError):
+            continue
+        n = count_lines(data)
+        lang = LANG_BY_EXT[ext]
+        lang_lines[lang] = lang_lines.get(lang, 0) + n
+        lang_files[lang] = lang_files.get(lang, 0) + 1
+        total += n
+        file_sizes.append((n, os.path.relpath(full, root), st.st_size))
+        if st.st_size > MAX_DUP_FILE_BYTES:
+            big_files_skipped.append(os.path.relpath(full, root))
+
+    if big_files_skipped:
+        trunc.append("%d 个大文件（>300KB）仅计入行数、跳过重复检测" %
+                     len(big_files_skipped))
+    return {
+        "total": total,
+        "lang_lines": lang_lines,
+        "lang_files": lang_files,
+        "file_sizes": file_sizes,
+    }
+
+
+# ---------------------------------------------------------------- 指标 2：直接依赖
+
+def parse_cargo_deps(text):
+    """解析 Cargo.toml：[dependencies] / [workspace.dependencies] / [dev-dependencies]。
+
+    子表 [dependencies.foo] 计 1 条（foo），其内部属性不再计入。
+    """
+    secs = {"dependencies": 0, "workspace.dependencies": 0,
+            "dev-dependencies": 0}
+    cur = None
+    sub = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("[") and s.endswith("]"):
+            header = s[1:-1].strip()
+            sub = False
+            if header in secs:
+                cur = header
+            elif header.startswith("workspace.dependencies."):
+                cur, sub = "workspace.dependencies", True
+            elif header.startswith("dependencies."):
+                cur, sub = "dependencies", True
+            elif header.startswith("dev-dependencies."):
+                cur, sub = "dev-dependencies", True
+            elif header.endswith(".dependencies"):
+                # target.'cfg(...)'.dependencies 归入普通 dependencies
+                cur, sub = "dependencies", True
+            elif header.endswith(".dev-dependencies"):
+                cur, sub = "dev-dependencies", True
+            else:
+                cur = None
+            if sub:
+                secs[cur] += 1
+            continue
+        if cur and not sub:
+            # 章节根层级的 key = value / key = { ... }
+            m = re.match(r'^(?:"([^"]+)"|[\w.-]+)\s*=', s)
+            if m:
+                secs[cur] += 1
+    return secs
+
+
+def parse_pubspec_deps(text):
+    """解析 pubspec.yaml 的 dependencies / dev_dependencies 顶层键。"""
+    secs = {"dependencies": 0, "dev_dependencies": 0}
+    cur = None
+    key_indent = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        s = raw.strip()
+        if indent == 0 and s.endswith(":"):
+            name = s[:-1].strip()
+            if name in secs:
+                cur = name
+                key_indent = None
+            else:
+                cur = None
+            continue
+        if cur:
+            if key_indent is None:
+                key_indent = indent
+            if indent == key_indent and ":" in s:
+                key = s.split(":", 1)[0].strip().strip("'\"")
+                if key not in ("flutter", "sdk"):
+                    secs[cur] += 1
+    return secs
+
+
+def parse_package_json_deps(text):
+    secs = {"dependencies": 0, "devDependencies": 0}
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return secs, True
+    for k in secs:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            secs[k] = len(v)
+    return secs, False
+
+
+def parse_go_mod_deps(text):
+    """解析 go.mod require 块，排除 // indirect 间接依赖。"""
+    count = 0
+    in_block = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("//"):
+            continue
+        if s.startswith("require ("):
+            in_block = True
+            continue
+        if in_block and s == ")":
+            in_block = False
+            continue
+        if in_block:
+            if "// indirect" in s:
+                continue
+            if re.match(r'\S+\s+v\S+', s):
+                count += 1
+            continue
+        m = re.match(r'require\s+(\S+)\s+v\S+', s)
+        if m:
+            if "// indirect" not in s:
+                count += 1
+    return {"require": count}
+
+
+def metric_deps(root, manifests):
+    rows = []
+    total = 0
+    for kind, path in manifests:
+        text = read_text(path)
+        rel = os.path.relpath(path, root)
+        bad_json = False
+        if kind == "cargo":
+            secs = parse_cargo_deps(text)
+        elif kind == "pubspec":
+            secs = parse_pubspec_deps(text)
+        elif kind == "package_json":
+            secs, bad_json = parse_package_json_deps(text)
+        else:
+            secs = parse_go_mod_deps(text)
+        n = sum(secs.values())
+        total += n
+        rows.append({"kind": kind, "path": rel, "sections": secs,
+                     "total": n, "parse_error": bad_json})
+    return {"total": total, "manifests": rows}
+
+
+# ---------------------------------------------------------------- 指标 4：重复块
+
+def normalize_line(line):
+    s = line.strip()
+    if len(s) < MIN_LINE_LEN:
+        return None
+    return re.sub(r"\s+", " ", s)
+
+
+def build_line_streams(root, src_files, trunc):
+    """读取源码，返回每个文件的有效行序列 (行号, 归一化内容) 与统计。"""
+    streams = []
+    skipped_big = 0
+    for fid, (full, ext) in enumerate(src_files):
+        try:
+            st = os.stat(full)
+        except OSError:
+            streams.append(None)
+            continue
+        if st.st_size > MAX_DUP_FILE_BYTES:
+            skipped_big += 1
+            streams.append(None)
+            continue
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except (OSError, PermissionError):
+            streams.append(None)
+            continue
+        text = data.decode("utf-8", "ignore")
+        lines = text.splitlines()
+        norm = []
+        for i, ln in enumerate(lines):
+            v = normalize_line(ln)
+            if v is not None:
+                norm.append((i + 1, v))
+        streams.append(norm if norm else None)
+    return streams, skipped_big
+
+
+def find_dup_blocks(root, src_files, streams, deadline, trunc):
+    """窗口哈希 + 向前扩展合并，返回候选重复块列表。"""
+    occ = {}            # hash -> [(fid, start_idx), ...]（有限）
+    occ_count = {}      # hash -> 真实出现次数
+    MASK = (1 << 64) - 1
+    B = 0x100000001B3
+    POW = pow(B, DUP_WINDOW - 1, 1 << 64)
+
+    groups_limited = False
+    for fid, stream in enumerate(streams):
+        if not stream or len(stream) < DUP_WINDOW:
+            continue
+        if time.monotonic() > deadline:
+            trunc.append("重复检测因 20 秒预算中止（已处理部分文件）")
+            return [], 0
+        digests = [int.from_bytes(
+            hashlib.blake2b(v.encode("utf-8"), digest_size=8).digest(),
+            "big") for _, v in stream]
+
+        h = 0
+        for i in range(DUP_WINDOW):
+            h = (h * B + digests[i]) & MASK
+        for i in range(len(digests) - DUP_WINDOW + 1):
+            occ_count[h] = occ_count.get(h, 0) + 1
+            lst = occ.setdefault(h, [])
+            if len(lst) < MAX_OCC_PER_HASH:
+                lst.append((fid, i))
+            if i + DUP_WINDOW < len(digests):
+                h = ((h - digests[i] * POW) & MASK)
+                h = (h * B + digests[i + DUP_WINDOW]) & MASK
+
+    # 只保留真正重复的哈希组
+    repeated = [(h, c) for h, c in occ_count.items()
+                if c >= 2 and len(occ.get(h, ())) >= 2]
+    repeated.sort(key=lambda x: (-x[1], x[0]))
+    if len(repeated) > MAX_DUP_GROUPS:
+        repeated = repeated[:MAX_DUP_GROUPS]
+        groups_limited = True
+        trunc.append("重复哈希组过多，仅分析前 %d 组" % MAX_DUP_GROUPS)
+
+    candidates = []
+    for h, cnt in repeated:
+        if time.monotonic() > deadline:
+            trunc.append("重复检测因 20 秒预算中止（已处理部分哈希组）")
+            groups_limited = True
+            break
+        starts = occ[h]
+        anchor = starts[0]
+        if streams[anchor[0]] is None:
+            continue
+        base_start = anchor[1]
+        best_len = 0
+        best_occ = 0
+        for other in starts[1:]:
+            if other == anchor or streams[other[0]] is None:
+                continue
+            sa = streams[anchor[0]]
+            sb = streams[other[0]]
+            la = len(sa) - base_start
+            lb = len(sb) - other[1]
+            maxlen = min(la, lb)
+            L = DUP_WINDOW
+            while L < maxlen and sa[base_start + L][1] == sb[other[1] + L][1]:
+                L += 1
+            if L > best_len:
+                best_len = L
+                # 统计有多少个出现点同样能覆盖 best_len
+                n_occ = 0
+                ref = [v for _, v in sa[base_start:base_start + best_len]]
+                for cand in starts:
+                    sc = streams[cand[0]]
+                    if sc is None:
+                        continue
+                    i0 = cand[1]
+                    if i0 + best_len > len(sc):
+                        continue
+                    if all(sc[i0 + k][1] == ref[k] for k in range(best_len)):
+                        n_occ += 1
+                best_occ = n_occ
+        if best_len >= DUP_WINDOW and best_occ >= 2:
+            candidates.append({
+                "hash": h,
+                "length": best_len,
+                "occ": best_occ,
+                "anchor": anchor,
+                "score": (best_occ - 1) * best_len,
+            })
+
+    # 去重：按块长度降序，丢弃落在已接受块内部候选（同一处重复只报一次）
+    candidates.sort(key=lambda c: (-c["length"], -c["occ"], c["anchor"]))
+    accepted = []
+    covered = set()   # (fid, 行号) 粗粒度覆盖：记录块内有效行序号区间
+    for c in candidates:
+        fid, sidx = c["anchor"]
+        stream = streams[fid]
+        if stream is None:
+            continue
+        start_line = stream[sidx][0]
+        end_idx = sidx + c["length"]
+        # 任一出现点若起点落在已接受区间内则视为重复报告
+        overlap = False
+        for other in occ.get(c["hash"], [])[:MAX_OCC_PER_HASH]:
+            ofid, oidx = other
+            ostream = streams[ofid]
+            if ostream is None:
+                continue
+            oline = ostream[oidx][0]
+            if (ofid, oline) in covered:
+                overlap = True
+                break
+        if overlap:
+            continue
+        # 记录覆盖（用有效行序号区间判断，简单可靠）
+        for k in range(c["length"]):
+            if sidx + k < len(stream):
+                covered.add((fid, stream[sidx + k][0]))
+        c["start_line"] = start_line
+        c["end_line"] = stream[min(end_idx - 1, len(stream) - 1)][0]
+        accepted.append(c)
+
+    for c in accepted:
+        fid = c["anchor"][0]
+        sidx = c["anchor"][1]
+        stream = streams[fid]
+        c["locations"] = []
+        ref = [v for _, v in stream[sidx:sidx + c["length"]]]
+        for other in occ.get(c["hash"], [])[:MAX_OCC_PER_HASH]:
+            ofid, oidx = other
+            ost = streams[ofid]
+            if ost is None or oidx + c["length"] > len(ost):
+                continue
+            if all(ost[oidx + k][1] == ref[k] for k in range(c["length"])):
+                c["locations"].append((
+                    os.path.relpath(src_files[ofid][0], root),
+                    ost[oidx][0], ost[oidx + c["length"] - 1][0],
+                ))
+
+    dup_blocks = len(accepted)
+    dup_lines = sum(c["score"] for c in accepted)
+    return accepted, dup_blocks, dup_lines
+
+
+# ---------------------------------------------------------------- 基准缓存
+
+def baseline_path(root):
+    name = os.path.basename(os.path.abspath(root))
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(STATE_DIR, "%s-%s.json" % (digest, name))
+
+
+def load_baseline(root):
+    p = baseline_path(root)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f), p
+    except (OSError, ValueError):
+        return None, p
+
+
+def save_baseline(root, metrics):
+    p = baseline_path(root)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        snapshot = {
+            "repo": os.path.abspath(root),
+            "saved_at": now_str(),
+            "total_lines": metrics["lines"]["total"],
+            "dependencies_total": metrics["deps"]["total"],
+            "max_file_lines": metrics["largest"][0]["lines"] if metrics["largest"] else 0,
+            "max_file_path": metrics["largest"][0]["path"] if metrics["largest"] else "",
+            "dup_blocks": metrics["dup_blocks"],
+            "dup_lines": metrics["dup_lines"],
+            "languages": metrics["lines"]["lang_lines"],
+        }
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        return p, True
+    except OSError:
+        return p, False
+
+
+def compare_metrics(cur, base):
+    def pct(c, b):
+        if b == 0:
+            return None if c == 0 else float("inf")
+        return (c - b) / b * 100.0
+
+    out = []
+    fields = [
+        ("代码行数", cur["total_lines"], base.get("total_lines")),
+        ("直接依赖数", cur["dependencies_total"], base.get("dependencies_total")),
+        ("最大单文件行数", cur["max_file_lines"], base.get("max_file_lines")),
+        ("重复块数", cur["dup_blocks"], base.get("dup_blocks")),
+    ]
+    for name, c, b in fields:
+        b = 0 if b is None else b
+        delta = c - b
+        if delta > 0:
+            mark = "↑ 回归（需功能性理由）"
+        elif delta < 0:
+            mark = "↓"
+        else:
+            mark = "="
+        p = pct(c, b)
+        if p is None:
+            ps = "—"
+        elif p == float("inf"):
+            ps = "+∞%"
+        else:
+            ps = "%+.1f%%" % p
+        out.append({"name": name, "current": c, "baseline": b,
+                    "delta": delta, "pct": ps, "mark": mark})
+    return out
+
+
+# ---------------------------------------------------------------- 汇总
+
+def collect(root):
+    start = time.monotonic()
+    deadline = start + TIME_BUDGET
+    trunc = []
+
+    src_files, manifests, wtr = walk_repo(root, deadline)
+    trunc.extend(wtr)
+
+    lines = metric_lines(root, src_files, trunc, deadline)
+    deps = metric_deps(root, manifests)
+
+    largest = sorted(lines["file_sizes"], key=lambda x: -x[0])[:5]
+    largest = [{"lines": n, "path": p} for n, p, _ in largest]
+
+    streams, skipped_big = build_line_streams(root, src_files, trunc)
+    blocks, dup_blocks, dup_lines = find_dup_blocks(
+        root, src_files, streams, deadline, trunc)
+
+    elapsed = time.monotonic() - start
+    if elapsed > TIME_BUDGET:
+        trunc.append("总耗时 %.1fs 超出 20 秒预算（结果仍为已算部分）" % elapsed)
+
+    return {
+        "repo": os.path.abspath(root),
+        "generated_at": now_str(),
+        "elapsed_s": round(elapsed, 2),
+        "files_scanned": len([1 for s in streams if s is not None]) if streams else 0,
+        "src_file_count": len(src_files),
+        "truncated": trunc,
+        "lines": lines,
+        "deps": deps,
+        "largest": largest,
+        "dup_blocks": dup_blocks,
+        "dup_lines": dup_lines,
+        "dup_top": sorted(blocks, key=lambda b: -b["score"])[:3],
+        "timed_out": elapsed > TIME_BUDGET,
+    }
+
+
+def render_text(m, base, base_path, cmp_rows, saved_path=None):
+    L = []
+    L.append("仓库体检 · %s" % os.path.basename(m["repo"]))
+    L.append("路径: %s" % m["repo"])
+    L.append("时间: %s    耗时 %.2fs    源码文件 %d 个" %
+             (m["generated_at"], m["elapsed_s"], m["src_file_count"]))
+    L.append("=" * 60)
+
+    # 指标 1
+    L.append("【1】代码行数")
+    L.append("  总计: %s 行" % fmt_int(m["lines"]["total"]))
+    lang = sorted(m["lines"]["lang_lines"].items(), key=lambda x: -x[1])
+    if lang:
+        L.append("  语言明细（前 5）:")
+        for name, n in lang[:5]:
+            L.append("    %-18s %10s 行  %4d 文件" %
+                     (name, fmt_int(n), m["lines"]["lang_files"].get(name, 0)))
+    else:
+        L.append("    （未发现纳入统计的源码文件）")
+
+    # 指标 2
+    L.append("")
+    L.append("【2】直接依赖数")
+    L.append("  总计: %s 条（各清单条目之和）" % fmt_int(m["deps"]["total"]))
+    for row in m["deps"]["manifests"]:
+        secs = row["sections"]
+        parts = ["%s %d" % (k, v) for k, v in secs.items()]
+        note = "  [JSON 解析失败]" if row.get("parse_error") else ""
+        L.append("    %-38s %s  → %d%s" %
+                 (row["path"], " / ".join(parts), row["total"], note))
+
+    # 指标 3
+    L.append("")
+    L.append("【3】最大单文件行数 top5")
+    if m["largest"]:
+        for i, f in enumerate(m["largest"], 1):
+            L.append("  %d. %8s 行  %s" % (i, fmt_int(f["lines"]), f["path"]))
+    else:
+        L.append("  （无源码文件）")
+
+    # 指标 4
+    L.append("")
+    L.append("【4】重复块 top3（窗口 %d 行，空白归一化）" % DUP_WINDOW)
+    L.append("  检出重复块: %d 个，重复冗余行(去重后计): %s" %
+             (m["dup_blocks"], fmt_int(m["dup_lines"])))
+    if not m["dup_top"]:
+        L.append("  （未发现 ≥%d 行、出现 ≥2 次的重复块）" % DUP_WINDOW)
+    for i, b in enumerate(m["dup_top"], 1):
+        L.append("  #%d 长度 %d 行 × 出现 %d 次" %
+                 (i, b["length"], b["occ"]))
+        for path, s, e in b["locations"][:6]:
+            L.append("      %s:%d-%d" % (path, s, e))
+        if len(b["locations"]) > 6:
+            L.append("      ... 另有 %d 处" % (len(b["locations"]) - 6))
+
+    # 截断提示
+    L.append("")
+    if m["truncated"]:
+        L.append("⚠ 已截断: " + "；".join(m["truncated"]))
+    else:
+        L.append("已截断: 无（全量扫描）")
+
+    # 基准对比
+    L.append("")
+    if cmp_rows:
+        L.append("【基准对比】基准: %s（保存于 %s）" %
+                 (base.get("saved_at", "?"), base_path))
+        for r in cmp_rows:
+            L.append("  %-14s %10s → %-10s Δ%-+9s %-8s %s" % (
+                r["name"], fmt_int(r["baseline"]), fmt_int(r["current"]),
+                "{:+,}".format(r["delta"]), r["pct"], r["mark"]))
+    elif base is None:
+        L.append("首版基准：暂无 baseline，建议加 --save 固化本次数字")
+    if saved_path:
+        L.append("已写入基准: %s" % saved_path)
+    L.append("=" * 60)
+    return "\n".join(L)
+
+
+def main(argv):
+    args = [a for a in argv[1:]]
+    json_mode = False
+    do_save = False
+    do_compare = False
+    path = None
+    for a in args:
+        if a in ("--json",):
+            json_mode = True
+        elif a in ("--save",):
+            do_save = True
+        elif a in ("--compare",):
+            do_compare = True
+        elif a in ("-h", "--help"):
+            print(__doc__ or "用法: repo-health <仓库路径> [--json|--save|--compare]")
+            return 0
+        elif a.startswith("-"):
+            sys.stderr.write("未知参数: %s\n" % a)
+            return 0
+        elif path is None:
+            path = a
+        else:
+            sys.stderr.write("多余参数: %s\n" % a)
+            return 0
+
+    if not path:
+        sys.stderr.write("用法: repo-health <仓库路径> [--json] [--save] [--compare]\n")
+        return 0
+
+    root = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(root):
+        sys.stderr.write("错误: 不是目录: %s\n" % root)
+        return 0
+
+    m = collect(root)
+    base, bpath = load_baseline(root)
+
+    # 默认：有 baseline 自动对比
+    auto_compare = base is not None
+    will_compare = do_compare or (auto_compare and not do_save)
+
+    cur = {
+        "total_lines": m["lines"]["total"],
+        "dependencies_total": m["deps"]["total"],
+        "max_file_lines": m["largest"][0]["lines"] if m["largest"] else 0,
+        "dup_blocks": m["dup_blocks"],
+    }
+    cmp_rows = compare_metrics(cur, base) if (will_compare and base) else []
+
+    saved_path = None
+    if do_save:
+        saved_path, ok = save_baseline(root, m)
+        if not ok and not json_mode:
+            sys.stderr.write("警告: 基准写入失败: %s\n" % saved_path)
+
+    if json_mode:
+        out = {
+            "repo": m["repo"],
+            "generated_at": m["generated_at"],
+            "elapsed_s": m["elapsed_s"],
+            "truncated": m["truncated"],
+            "metrics": {
+                "total_lines": m["lines"]["total"],
+                "languages": m["lines"]["lang_lines"],
+                "language_files": m["lines"]["lang_files"],
+                "dependencies_total": m["deps"]["total"],
+                "manifests": m["deps"]["manifests"],
+                "largest_files": m["largest"],
+                "dup_blocks": m["dup_blocks"],
+                "dup_lines": m["dup_lines"],
+                "dup_top": [
+                    {"length": b["length"], "occurrences": b["occ"],
+                     "locations": [{"file": p_, "start": s_, "end": e_}
+                                   for p_, s_, e_ in b["locations"]]}
+                    for b in m["dup_top"]
+                ],
+            },
+            "baseline": {
+                "path": bpath,
+                "exists": base is not None,
+                "saved_at": base.get("saved_at") if base else None,
+                "compared": bool(cmp_rows),
+                "deltas": cmp_rows,
+            },
+            "saved": saved_path,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+
+    print(render_text(m, base, bpath, cmp_rows, saved_path))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:  # 体检工具永远退出 0，错误也如实报告
+        sys.stderr.write("内部错误: %s: %s\n" % (type(e).__name__, e))
+        sys.exit(0)

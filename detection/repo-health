@@ -15,11 +15,16 @@
 # 用法：
 #   repo-health <仓库路径>            打印中文体检表
 #   repo-health <仓库路径> --json     机器可读 JSON
-#   repo-health <仓库路径> --save     把本次四数字写入基准缓存
-#   repo-health <仓库路径> --compare  与基准缓存对比（默认有基准就自动对比）
+#   repo-health <仓库路径> --save     写入项目内基准 docs/health-baseline.json
+#   repo-health <仓库路径> --save --state  写入旧全局缓存（兼容能力，兜底用）
+#   repo-health <仓库路径> --compare  与基准对比（默认有基准就自动对比）
 #
-# 基准位置：~/.local/state/repo-health/<目录名sha1前8位>-<目录名>.json
-# 绝不写入被测仓库工作区。
+# 基准查找顺序（先项目内，后全局缓存）：
+#   1. <仓库>/docs/health-baseline.json                 项目内基准，推荐随代码提交
+#   2. ~/.local/state/repo-health/<目录名sha1前8位>-<目录名>.json  旧全局缓存，仅兜底
+#   3. 都没有                                            提示首版基准
+#
+# 只写基准 JSON，不改动被测仓库源码。
 #
 # 退出码永远为 0（体检是信息工具，不是门禁）。
 
@@ -28,6 +33,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -78,6 +84,12 @@ STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
     "repo-health",
 )
+
+# 项目内基准（推荐位置，随代码提交）
+PROJECT_BASELINE_REL = os.path.join("docs", "health-baseline.json")
+
+# 基准 JSON 版本号
+SCHEMA = 1
 
 PACKAGE_DIR_NAMES = {
     "frontend", "frontend_flutter", "panel", "webui", "web", "ui",
@@ -523,43 +535,217 @@ def find_dup_blocks(root, src_files, streams, deadline, trunc):
     return accepted, dup_blocks, dup_lines
 
 
-# ---------------------------------------------------------------- 基准缓存
+# ---------------------------------------------------------------- 基准存储
+#
+# 查找顺序：项目内 docs/health-baseline.json 优先，旧全局缓存降为兜底。
+# 两种格式都要能读：schema=1 新格式，以及旧的扁平全局缓存格式。
 
-def baseline_path(root):
+
+def project_baseline_path(root):
+    return os.path.join(os.path.abspath(root), PROJECT_BASELINE_REL)
+
+
+def state_baseline_path(root):
+    """旧全局缓存路径（兼容保留，--state 时才写）。"""
     name = os.path.basename(os.path.abspath(root))
     digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     return os.path.join(STATE_DIR, "%s-%s.json" % (digest, name))
 
 
-def load_baseline(root):
-    p = baseline_path(root)
+def _git(root, args):
+    """跑一条 git 命令，返回 (stdout 去空白 或 None, 是否成功)。
+
+    取不到（非 git 仓库/git 不存在/超时）一律当"不知道"，不影响体检主流程。
+    """
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f), p
+        r = subprocess.run(["git", "-C", os.path.abspath(root)] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None, False
+    if r.returncode != 0:
+        return None, False
+    return r.stdout.decode("utf-8", "ignore").strip(), True
+
+
+def git_head(root):
+    out, ok = _git(root, ["rev-parse", "--short", "HEAD"])
+    return out if (ok and out) else None
+
+
+def git_dirty(root):
+    """工作区是否脏：status --porcelain 非空即脏。
+
+    基准文件自身（docs/health-baseline.json）不参与判定——否则每次 --save
+    都会把自己记成脏工作区。
+    """
+    out, ok = _git(root, ["status", "--porcelain", "--",
+                          ".", ":(exclude)" + PROJECT_BASELINE_REL])
+    if not ok:
+        return False
+    return bool(out)
+
+
+def git_commits_between(root, base_head):
+    """base_head..HEAD 的提交数；算不出返回 None（该行就不显示）。"""
+    if not base_head:
+        return None
+    out, ok = _git(root, ["rev-list", "--count", "%s..HEAD" % base_head])
+    if not ok or not out:
+        return None
+    try:
+        n = int(out.split()[0])
+    except (ValueError, IndexError):
+        return None
+    return n if n >= 0 else None
+
+
+def iso_now():
+    """本地时区 ISO8601，如 2026-11-18T02:20:11+08:00。"""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def fmt_saved_at(s):
+    """基准时间显示：ISO8601 / 旧的 'YYYY-MM-DD HH:MM:SS' 都收窄成 时:分。"""
+    if not s:
+        return "时间未知"
+    txt = str(s).strip()
+    try:
+        dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+    except ValueError:
+        return txt
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def build_snapshot(root, m):
+    """按 schema=1 组基准快照（键顺序由 json dump 的 sort_keys 固定）。"""
+    maxf = m["largest"][0] if m["largest"] else {"lines": 0, "path": ""}
+    return {
+        "schema": SCHEMA,
+        "repo": os.path.abspath(root),
+        "name": os.path.basename(os.path.abspath(root)),
+        "saved_at": iso_now(),
+        "git_head": git_head(root),
+        "git_dirty": git_dirty(root),
+        "metrics": {
+            "loc_total": m["lines"]["total"],
+            "loc_by_lang": dict(m["lines"]["lang_lines"]),
+            "deps_total": m["deps"]["total"],
+            "deps_by_manifest": {row["path"]: row["total"]
+                                 for row in m["deps"]["manifests"]},
+            "max_file_lines": maxf["lines"],
+            "max_file_path": maxf["path"],
+            "dup_blocks": m["dup_blocks"],
+            "dup_redundant_lines": m["dup_lines"],
+        },
+        "notes": "",
+    }
+
+
+def _as_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_baseline(obj, kind):
+    """把新旧两种基准格式归一成一套字段，坏数据给安全默认值，绝不抛异常。"""
+    if not isinstance(obj, dict):
+        obj = {}
+    metrics = obj.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    def pick(new_key, old_key, default):
+        for v in (metrics.get(new_key), obj.get(old_key), obj.get(new_key)):
+            if v is not None:
+                return v
+        return default
+
+    lang = metrics.get("loc_by_lang")
+    if not isinstance(lang, dict):
+        lang = obj.get("languages")
+    if not isinstance(lang, dict):
+        lang = {}
+    lang = {str(k): _as_int(v) for k, v in lang.items()}
+
+    return {
+        "schema": _as_int(obj.get("schema"), 0),
+        "kind": kind,
+        "repo": obj.get("repo"),
+        "name": obj.get("name"),
+        "saved_at": obj.get("saved_at"),
+        "git_head": obj.get("git_head") if isinstance(obj.get("git_head"), str) else None,
+        "git_dirty": bool(obj.get("git_dirty", False)),
+        "loc_total": _as_int(pick("loc_total", "total_lines", 0)),
+        "loc_by_lang": lang,
+        "deps_total": _as_int(pick("deps_total", "dependencies_total", 0)),
+        "max_file_lines": _as_int(pick("max_file_lines", "max_file_lines", 0)),
+        "max_file_path": pick("max_file_path", "max_file_path", "") or "",
+        "dup_blocks": _as_int(pick("dup_blocks", "dup_blocks", 0)),
+        "dup_redundant_lines": _as_int(pick("dup_redundant_lines", "dup_lines", 0)),
+    }
+
+
+def load_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), True
     except (OSError, ValueError):
-        return None, p
+        return None, False
 
 
-def save_baseline(root, metrics):
-    p = baseline_path(root)
+def resolve_baseline(root):
+    """按 项目内 → 旧全局缓存 → 无 的顺序找基准。
+
+    返回 dict：base(归一后的基准或 None)、path(命中的路径)、
+    kind(project|state|none)、warn(提示列表)。
+    """
+    warn = []
+    p_proj = project_baseline_path(root)
+    p_state = state_baseline_path(root)
+
+    if os.path.isfile(p_proj):
+        obj, ok = load_json_file(p_proj)
+        if ok:
+            return {"base": normalize_baseline(obj, "project"), "path": p_proj,
+                    "kind": "project", "warn": warn}
+        warn.append("项目内基准 %s 解析失败，已忽略" % p_proj)
+
+    if os.path.isfile(p_state):
+        obj, ok = load_json_file(p_state)
+        if ok:
+            return {"base": normalize_baseline(obj, "state"), "path": p_state,
+                    "kind": "state", "warn": warn}
+        warn.append("旧缓存 %s 解析失败，已忽略" % p_state)
+
+    return {"base": None, "path": p_proj, "kind": "none", "warn": warn}
+
+
+def save_baseline(root, m, to_state=False):
+    """写基准：默认项目内 docs/health-baseline.json，to_state=True 写旧全局缓存。
+
+    返回 (路径, 是否成功, 是否覆盖了已有文件)。
+    """
+    if to_state:
+        p = state_baseline_path(root)
+        target_dir = STATE_DIR
+    else:
+        p = project_baseline_path(root)
+        target_dir = os.path.dirname(p)
+    existed = os.path.isfile(p)
+    snapshot = build_snapshot(root, m)
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        snapshot = {
-            "repo": os.path.abspath(root),
-            "saved_at": now_str(),
-            "total_lines": metrics["lines"]["total"],
-            "dependencies_total": metrics["deps"]["total"],
-            "max_file_lines": metrics["largest"][0]["lines"] if metrics["largest"] else 0,
-            "max_file_path": metrics["largest"][0]["path"] if metrics["largest"] else "",
-            "dup_blocks": metrics["dup_blocks"],
-            "dup_lines": metrics["dup_lines"],
-            "languages": metrics["lines"]["lang_lines"],
-        }
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-        return p, True
+            # sort_keys + indent=2：固定键序，git diff 只显示真实变化
+            json.dump(snapshot, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+        return p, True, existed
     except OSError:
-        return p, False
+        return p, False, existed
 
 
 def compare_metrics(cur, base):
@@ -570,8 +756,8 @@ def compare_metrics(cur, base):
 
     out = []
     fields = [
-        ("代码行数", cur["total_lines"], base.get("total_lines")),
-        ("直接依赖数", cur["dependencies_total"], base.get("dependencies_total")),
+        ("代码行数", cur["total_lines"], base.get("loc_total")),
+        ("直接依赖数", cur["dependencies_total"], base.get("deps_total")),
         ("最大单文件行数", cur["max_file_lines"], base.get("max_file_lines")),
         ("重复块数", cur["dup_blocks"], base.get("dup_blocks")),
     ]
@@ -637,7 +823,7 @@ def collect(root):
     }
 
 
-def render_text(m, base, base_path, cmp_rows, saved_path=None):
+def render_text(m, info, cmp_rows, saved_path=None, save_existed=False):
     L = []
     L.append("仓库体检 · %s" % os.path.basename(m["repo"]))
     L.append("路径: %s" % m["repo"])
@@ -701,17 +887,33 @@ def render_text(m, base, base_path, cmp_rows, saved_path=None):
 
     # 基准对比
     L.append("")
-    if cmp_rows:
-        L.append("【基准对比】基准: %s（保存于 %s）" %
-                 (base.get("saved_at", "?"), base_path))
+    base = info["base"]
+    for w in info["warn"]:
+        L.append("⚠ " + w)
+    if base is not None:
+        when = fmt_saved_at(base.get("saved_at"))
+        head = base.get("git_head") or "commit 未知"
+        state = "工作区有未提交改动" if base.get("git_dirty") else "工作区干净"
+        L.append("【基准对比】基准: %s · %s · %s" % (when, head, state))
+        kind = info["kind"]
+        src = "项目内 docs/health-baseline.json" if kind == "project" else "旧全局缓存"
+        L.append("  来源: %s（%s）" % (src, info["path"]))
+        if kind == "state" and not saved_path:
+            L.append("  ⚠ 旧缓存，建议 --save 迁到项目内 docs/health-baseline.json")
+        if base.get("git_dirty"):
+            L.append("  ⚠ 基准取自脏工作区，对比意义有限")
+        n = git_commits_between(m["repo"], base.get("git_head"))
+        if n:
+            L.append("  ⚠ 代码已推进 %d 个 commit 后再比" % n)
         for r in cmp_rows:
             L.append("  %-14s %10s → %-10s Δ%-+9s %-8s %s" % (
                 r["name"], fmt_int(r["baseline"]), fmt_int(r["current"]),
                 "{:+,}".format(r["delta"]), r["pct"], r["mark"]))
-    elif base is None:
-        L.append("首版基准：暂无 baseline，建议加 --save 固化本次数字")
+    else:
+        L.append("首版基准：暂无 baseline，建议 --save 固化本次数字"
+                 "（写入 docs/health-baseline.json）")
     if saved_path:
-        L.append("已写入基准: %s" % saved_path)
+        L.append("%s基准: %s" % ("已覆盖旧" if save_existed else "已写入", saved_path))
     L.append("=" * 60)
     return "\n".join(L)
 
@@ -721,6 +923,7 @@ def main(argv):
     json_mode = False
     do_save = False
     do_compare = False
+    to_state = False
     path = None
     for a in args:
         if a in ("--json",):
@@ -729,8 +932,11 @@ def main(argv):
             do_save = True
         elif a in ("--compare",):
             do_compare = True
+        elif a in ("--state",):
+            to_state = True
         elif a in ("-h", "--help"):
-            print(__doc__ or "用法: repo-health <仓库路径> [--json|--save|--compare]")
+            print(__doc__ or
+                  "用法: repo-health <仓库路径> [--json|--save [--state]|--compare]")
             return 0
         elif a.startswith("-"):
             sys.stderr.write("未知参数: %s\n" % a)
@@ -742,7 +948,8 @@ def main(argv):
             return 0
 
     if not path:
-        sys.stderr.write("用法: repo-health <仓库路径> [--json] [--save] [--compare]\n")
+        sys.stderr.write(
+            "用法: repo-health <仓库路径> [--json] [--save [--state]] [--compare]\n")
         return 0
 
     root = os.path.abspath(os.path.expanduser(path))
@@ -751,7 +958,8 @@ def main(argv):
         return 0
 
     m = collect(root)
-    base, bpath = load_baseline(root)
+    info = resolve_baseline(root)
+    base = info["base"]
 
     # 默认：有 baseline 自动对比
     auto_compare = base is not None
@@ -766,8 +974,9 @@ def main(argv):
     cmp_rows = compare_metrics(cur, base) if (will_compare and base) else []
 
     saved_path = None
+    save_existed = False
     if do_save:
-        saved_path, ok = save_baseline(root, m)
+        saved_path, ok, save_existed = save_baseline(root, m, to_state=to_state)
         if not ok and not json_mode:
             sys.stderr.write("警告: 基准写入失败: %s\n" % saved_path)
 
@@ -794,18 +1003,28 @@ def main(argv):
                 ],
             },
             "baseline": {
-                "path": bpath,
+                "path": info["path"],
+                "kind": info["kind"],
                 "exists": base is not None,
+                "legacy_cache": info["kind"] == "state",
+                "migrate_hint": ("旧缓存，建议 --save 迁到项目内 "
+                                 "docs/health-baseline.json"
+                                 if info["kind"] == "state" else None),
                 "saved_at": base.get("saved_at") if base else None,
+                "git_head": base.get("git_head") if base else None,
+                "git_dirty": base.get("git_dirty") if base else None,
+                "commits_since": (git_commits_between(m["repo"], base.get("git_head"))
+                                  if base else None),
                 "compared": bool(cmp_rows),
                 "deltas": cmp_rows,
+                "warnings": info["warn"],
             },
             "saved": saved_path,
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
 
-    print(render_text(m, base, bpath, cmp_rows, saved_path))
+    print(render_text(m, info, cmp_rows, saved_path, save_existed))
     return 0
 
 
